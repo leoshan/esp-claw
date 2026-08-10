@@ -5,6 +5,7 @@ idf_component_register(
         app_claw
         app_config
         cap_voice_pipeline
+        cap_im_platform
         wifi_manager
         http_server
         captive_dns

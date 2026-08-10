@@ -18,7 +18,9 @@
 #include "esp_lcd_gc9d01.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_io.h"
+#if __has_include("esp_lcd_panel_nt35510.h")
 #include "esp_lcd_panel_nt35510.h"
+#endif
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_sh8601.h"
@@ -409,7 +411,11 @@ static esp_err_t lua_lcd_create_panel(const lua_lcd_create_config_t *cfg,
     case LUA_LCD_CONTROLLER_GC9D01:
         return esp_lcd_new_panel_gc9d01(io_handle, &panel_cfg, out_panel_handle);
     case LUA_LCD_CONTROLLER_NT35510:
+#if __has_include("esp_lcd_panel_nt35510.h")
         return esp_lcd_new_panel_nt35510(io_handle, &panel_cfg, out_panel_handle);
+#else
+        return ESP_ERR_NOT_SUPPORTED;
+#endif
     case LUA_LCD_CONTROLLER_CO5300: {
         co5300_vendor_config_t vendor_cfg = { 0 };
         vendor_cfg.flags.use_qspi_interface = cfg->mode == LUA_LCD_BUS_MODE_QSPI;

@@ -12,6 +12,5 @@ idf_component_register(
         cap_im_local
         app_config
         esp_http_client
-        cJSON
         driver
 )

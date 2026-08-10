@@ -9,6 +9,7 @@ idf_component_register(
     REQUIRES
         claw_cap
         claw_event_router
+        cap_im_local
         app_config
         esp_http_client
         cJSON

@@ -15,8 +15,8 @@
 #include "freertos/task.h"
 
 #include "claw_cap.h"
-#include "claw_event_router.h"
-#include "claw_event.h"
+#include "claw_event_publisher.h"
+#include "cap_im_local.h"
 #include "app_config.h"
 
 static const char *TAG = "cap_voice_pipeline";
@@ -33,6 +33,32 @@ static TaskHandle_t s_record_task_handle = NULL;
 #define RECORD_DURATION_SEC 4
 #define RECORD_SAMPLE_RATE  16000
 #define RECORD_BUFFER_SIZE  (RECORD_SAMPLE_RATE * 2 * RECORD_DURATION_SEC) // 16-bit Mono = 2 bytes per sample
+
+/**
+ * Outbound callback registered with cap_im_local.
+ * When esp-claw Agent Loop completes reasoning and emits the final reply text,
+ * this function is invoked to convert the text response into TTS audio playback.
+ */
+static esp_err_t on_agent_outbound_message_cb(const cap_im_local_message_t *message, void *user_ctx)
+{
+    (void)user_ctx;
+    if (!message || !message->text || message->text[0] == '\0') {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Agent Outbound Response Received: '%s' -> Synthesizing Volcengine TTS Audio...", message->text);
+
+    if (s_config) {
+        esp_err_t ret = volcengine_tts_speak(s_config, message->text);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Volcengine TTS playback completed successfully.");
+        } else {
+            ESP_LOGE(TAG, "Volcengine TTS playback failed: %s", esp_err_to_name(ret));
+        }
+    }
+
+    return ESP_OK;
+}
 
 static void voice_record_asr_task(void *pvParameters)
 {
@@ -68,17 +94,27 @@ static void voice_record_asr_task(void *pvParameters)
     if (s_config && total_read > 0) {
         esp_err_t asr_err = volcengine_sensevoice_asr_recognize(s_config, pcm_buffer, total_read, text_out, sizeof(text_out));
         if (asr_err == ESP_OK && text_out[0] != '\0') {
-            ESP_LOGI(TAG, "Recognized Voice Query: %s. Forwarding to esp-claw Event Router...", text_out);
+            ESP_LOGI(TAG, "SenseVoice ASR Success! Text: '%s'", text_out);
+            ESP_LOGI(TAG, "Publishing recognized ASR text into esp-claw Agent Event Router...");
 
-            // Dispatch recognized voice text into esp-claw Agent Event Router
-            claw_event_t evt = {
-                .type = CLAW_EVENT_IM_MESSAGE,
-                .payload = strdup(text_out)
-            };
-            claw_event_dispatch(&evt);
+            // 1. Publish recognized user voice query into esp-claw Agent Event Router
+            char msg_id[64];
+            snprintf(msg_id, sizeof(msg_id), "voice-%lu", (unsigned long)xTaskGetTickCount());
 
-            // Optional: Speak acknowledgement
-            volcengine_tts_speak(s_config, "正在处理您的指令");
+            esp_err_t pub_err = claw_event_router_publish_message(
+                "voice_gateway", // Source Capability
+                "local",         // Channel
+                "voice_user",    // Chat ID
+                text_out,        // Recognized text content
+                "voice_user",    // Sender ID
+                msg_id           // Message ID
+            );
+
+            if (pub_err == ESP_OK) {
+                ESP_LOGI(TAG, "Successfully published voice message to esp-claw Agent Loop.");
+            } else {
+                ESP_LOGE(TAG, "Failed to publish voice message to esp-claw: %s", esp_err_to_name(pub_err));
+            }
         } else {
             ESP_LOGW(TAG, "ASR Recognition failed or no speech detected.");
             volcengine_tts_speak(s_config, "未能识别到说话内容");
@@ -119,13 +155,16 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
     s_config = config;
     ESP_LOGI(TAG, "Initializing cap_voice_pipeline Capability...");
 
-    // Initialize I2S Hardware
+    // 1. Initialize I2S Hardware
     esp_err_t ret = i2s_audio_driver_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize I2S audio driver: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    ESP_LOGI(TAG, "cap_voice_pipeline initialized successfully (ASR: Volcengine SenseVoice, Hardware: Breadboard I2S)");
+    // 2. Register Outbound Callback to intercept Agent reply text and convert to Volcengine TTS
+    cap_im_local_set_outbound_callback(on_agent_outbound_message_cb, NULL);
+
+    ESP_LOGI(TAG, "cap_voice_pipeline initialized successfully (ASR: Volcengine SenseVoice -> Event Router, Response -> Volcengine TTS)");
     return ESP_OK;
 }

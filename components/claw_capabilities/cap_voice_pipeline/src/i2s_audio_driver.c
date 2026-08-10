@@ -5,6 +5,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/gpio.h"

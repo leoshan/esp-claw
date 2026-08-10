@@ -8,4 +8,6 @@ idf_component_register(
         wifi_manager
         http_server
         captive_dns
+        cmd_wifi
+        esp_app_format
 )

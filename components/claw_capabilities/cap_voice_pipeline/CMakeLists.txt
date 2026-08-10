@@ -13,4 +13,6 @@ idf_component_register(
         app_config
         esp_http_client
         driver
+        esp_driver_gpio
+        esp_driver_i2s
 )

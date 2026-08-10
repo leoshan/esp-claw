@@ -14,4 +14,5 @@ idf_component_register(
         esp_lcd_sh8601
         esp_lcd_st77916
         esp_lcd_st77922
+        esp_lcd_nt35510
 )

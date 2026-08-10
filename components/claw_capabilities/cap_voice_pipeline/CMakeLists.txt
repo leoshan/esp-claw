@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "src/cap_voice_pipeline.c"
+        "src/volcengine_sensevoice_asr.c"
+        "src/volcengine_tts.c"
+        "src/i2s_audio_driver.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        claw_cap
+        claw_event_router
+        app_config
+        esp_http_client
+        cJSON
+        driver
+)

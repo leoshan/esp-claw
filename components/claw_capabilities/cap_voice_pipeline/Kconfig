@@ -1,0 +1,9 @@
+menu "Voice Pipeline Capability Configuration"
+
+config CLAW_CAP_VOICE_PIPELINE_ENABLED
+    bool "Enable Voice Pipeline Capability"
+    default y
+    help
+        Enables I2S Hardware Audio Pipeline with Volcengine SenseVoice ASR and TTS.
+
+endmenu

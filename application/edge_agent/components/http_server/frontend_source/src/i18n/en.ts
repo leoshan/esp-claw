@@ -18,6 +18,7 @@ export const en = {
   navSystemSettings: 'System Settings',
   navBasic: 'Basic Settings',
   navLlm: 'LLM',
+  navVoice: 'Voice Services (ASR/TTS)',
   navIm: 'IM',
   navWebReq: 'Network & Search Config',
   navMemory: 'Memory',

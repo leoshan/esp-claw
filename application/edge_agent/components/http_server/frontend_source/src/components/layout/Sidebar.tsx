@@ -6,6 +6,7 @@ import {
   Folder,
   MessageSquareCode,
   MessagesSquare,
+  Mic,
   Search,
   Settings,
   SquareFunction,
@@ -22,6 +23,7 @@ const IconStatus: Component = () => <Activity class={iconClass} />;
 const IconGear: Component = () => <Settings class={iconClass} />;
 const IconWifi: Component = () => <WifiPen class={iconClass} />;
 const IconLlm: Component = () => <Bot class={iconClass} />;
+const IconVoice: Component = () => <Mic class={iconClass} />;
 const IconIm: Component = () => <MessageSquareCode class={iconClass} />;
 const IconSearch: Component = () => <Search class={iconClass} />;
 const IconMemory: Component = () => <DatabaseZap class={iconClass} />;
@@ -37,6 +39,7 @@ export type LeafNode = {
     | 'navStatus'
     | 'navBasic'
     | 'navLlm'
+    | 'navVoice'
     | 'navIm'
     | 'navWebReq'
     | 'navMemory'
@@ -65,6 +68,7 @@ export const NAV_TREE: NavNode[] = [
     children: [
       { kind: 'leaf', id: 'basic', labelKey: 'navBasic', icon: IconWifi },
       { kind: 'leaf', id: 'llm', labelKey: 'navLlm', icon: IconLlm },
+      { kind: 'leaf', id: 'voice', labelKey: 'navVoice', icon: IconVoice },
       { kind: 'leaf', id: 'im', labelKey: 'navIm', icon: IconIm },
       { kind: 'leaf', id: 'webreq', labelKey: 'navWebReq', icon: IconSearch },
     ],

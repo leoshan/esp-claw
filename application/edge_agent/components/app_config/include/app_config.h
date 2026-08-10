@@ -54,6 +54,16 @@ typedef struct {
     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
     char enabled_lua_modules[APP_CONFIG_STR_LEN];
     char time_timezone[APP_CONFIG_TIMEZONE_LEN];
+    char asr_provider[32];
+    char asr_api_key[APP_CONFIG_STR_LEN];
+    char asr_app_id[64];
+    char asr_resource_id[64];
+    char asr_base_url[APP_CONFIG_STR_LEN];
+    char tts_provider[32];
+    char tts_api_key[APP_CONFIG_STR_LEN];
+    char tts_app_id[64];
+    char tts_voice_type[64];
+    char tts_base_url[APP_CONFIG_STR_LEN];
 } app_config_t;
 
 esp_err_t app_config_init(void);

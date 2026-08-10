@@ -20,6 +20,7 @@ export const zhCn: Dict = {
   navSystemSettings: '系统设置',
   navBasic: '基本设置',
   navLlm: 'LLM 设置',
+  navVoice: '语音服务 (ASR/TTS)',
   navIm: 'IM 设置',
   navWebReq: '网络和搜索设置',
   navMemory: '记忆管理',

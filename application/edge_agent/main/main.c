@@ -29,6 +29,7 @@
 #include "cap_im_wechat.h"
 #endif
 #include "app_config.h"
+#include "cap_voice_pipeline.h"
 
 #define APP_ENABLE_MEM_LOG        (0)
 
@@ -414,6 +415,7 @@ void app_main(void)
 #if CONFIG_APP_CLAW_CAP_IM_LOCAL
     ESP_ERROR_CHECK(http_server_webim_bind_im());
 #endif
+    cap_voice_pipeline_init(s_config);
 
     register_wifi_command();
 

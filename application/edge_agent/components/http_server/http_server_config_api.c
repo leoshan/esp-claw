@@ -76,6 +76,17 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
     CONFIG_FIELD("time",         time_timezone),
+
+    CONFIG_FIELD("voice",        asr_provider),
+    CONFIG_FIELD("voice",        asr_api_key),
+    CONFIG_FIELD("voice",        asr_app_id),
+    CONFIG_FIELD("voice",        asr_resource_id),
+    CONFIG_FIELD("voice",        asr_base_url),
+    CONFIG_FIELD("voice",        tts_provider),
+    CONFIG_FIELD("voice",        tts_api_key),
+    CONFIG_FIELD("voice",        tts_app_id),
+    CONFIG_FIELD("voice",        tts_voice_type),
+    CONFIG_FIELD("voice",        tts_base_url),
 };
 
 static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);

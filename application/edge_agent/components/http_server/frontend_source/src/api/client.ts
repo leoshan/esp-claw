@@ -39,11 +39,21 @@ export type AppConfig = {
   llm_visible_cap_groups: string;
   enabled_lua_modules: string;
   time_timezone: string;
+  asr_provider: string;
+  asr_api_key: string;
+  asr_app_id: string;
+  asr_resource_id: string;
+  asr_base_url: string;
+  tts_provider: string;
+  tts_api_key: string;
+  tts_app_id: string;
+  tts_voice_type: string;
+  tts_base_url: string;
 };
 
 /** Server-side configuration groups (must stay in sync with
  * CONFIG_FIELDS in http_server_config_api.c). */
-export type ConfigGroup = 'wifi' | 'llm' | 'im' | 'search' | 'capabilities' | 'skills' | 'time';
+export type ConfigGroup = 'wifi' | 'llm' | 'im' | 'search' | 'capabilities' | 'skills' | 'time' | 'voice';
 
 export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   wifi: ['wifi_ssid', 'wifi_password', 'ap_ssid', 'ap_password', 'ap_behavior'],
@@ -77,6 +87,18 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
+  voice: [
+    'asr_provider',
+    'asr_api_key',
+    'asr_app_id',
+    'asr_resource_id',
+    'asr_base_url',
+    'tts_provider',
+    'tts_api_key',
+    'tts_app_id',
+    'tts_voice_type',
+    'tts_base_url',
+  ],
 };
 
 export function blankConfig(): Partial<AppConfig> {

@@ -25,6 +25,9 @@ const MemoryPage = lazy(() =>
   import('./pages/MemoryPage').then((mod) => ({ default: mod.MemoryPage })),
 );
 const LlmPage = lazy(() => import('./pages/LlmPage').then((mod) => ({ default: mod.LlmPage })));
+const VoicePage = lazy(() =>
+  import('./pages/VoicePage').then((mod) => ({ default: mod.VoicePage })),
+);
 const ImPage = lazy(() => import('./pages/ImPage').then((mod) => ({ default: mod.ImPage })));
 const CapabilitiesPage = lazy(() =>
   import('./pages/CapabilitiesPage').then((mod) => ({ default: mod.CapabilitiesPage })),
@@ -245,6 +248,9 @@ const App: Component = () => {
               </Show>
               <Show when={currentTab() === 'llm'}>
                 <LlmPage />
+              </Show>
+              <Show when={currentTab() === 'voice'}>
+                <VoicePage />
               </Show>
               <Show when={currentTab() === 'im'}>
                 <ImPage />

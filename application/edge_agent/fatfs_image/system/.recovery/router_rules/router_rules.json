@@ -30,6 +30,31 @@
     ]
   },
   {
+    "id": "startup_voice_push_to_talk",
+    "description": "Start the push-to-talk background script once the device finishes booting, so the BOOT button can drive voice capture.",
+    "enabled": true,
+    "consume_on_match": false,
+    "ack": "push-to-talk watcher started",
+    "match": {
+      "source_cap": "app_claw",
+      "event_type": "startup",
+      "event_key": "boot_completed",
+      "content_type": "trigger"
+    },
+    "actions": [
+      {
+        "type": "call_cap",
+        "cap": "lua_run_script_async",
+        "input": {
+          "path": "/system/skills/voice_push_to_talk/scripts/push_to_talk.lua",
+          "timeout_ms": 0,
+          "name": "voice_ptt",
+          "exclusive": "voice_ptt"
+        }
+      }
+    ]
+  },
+  {
     "id": "im_session_command",
     "description": "Handle persistent chat session commands when the user sends /session.",
     "enabled": true,
@@ -85,6 +110,35 @@
         "input": {
           "channel": "{{event.source_channel}}",
           "chat_id": "{{event.chat_id}}"
+        }
+      }
+    ]
+  },
+  {
+    "id": "im_voice_listen_command",
+    "description": "Start voice capture when an IM user sends /listen, so a phone can trigger the microphone.",
+    "enabled": true,
+    "consume_on_match": true,
+    "ack": "{{event.source_channel}} voice capture started",
+    "match": {
+      "event_type": "message",
+      "event_key": "text",
+      "content_type": "text",
+      "text": "/listen",
+      "text_match_rule": "prefix"
+    },
+    "actions": [
+      {
+        "type": "call_cap",
+        "cap": "voice_listen",
+        "input": {}
+      },
+      {
+        "type": "send_message",
+        "input": {
+          "channel": "{{event.source_channel}}",
+          "chat_id": "{{event.chat_id}}",
+          "message": "🎙️ 正在听，请讲…"
         }
       }
     ]

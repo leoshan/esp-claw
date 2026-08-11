@@ -73,6 +73,9 @@ static const char *TAG = "volcengine_asr";
 #define ASR_MAX_CAPTURE_MS   (CONFIG_CLAW_CAP_VOICE_RECORD_DURATION_SEC * 1000)
 #define ASR_CONNECT_WAIT_MS  10000
 #define ASR_RESULT_WAIT_MS   15000
+/* Frame payload buffer. The handshake headers use a separate buffer sized by
+ * CONFIG_WS_BUFFER_SIZE, which must be large enough for this endpoint's
+ * response headers (see the board's sdkconfig.defaults.board). */
 #define ASR_WS_BUFFER_SIZE   8192
 #define ASR_WS_TASK_STACK    6144
 

@@ -25,6 +25,14 @@ typedef struct {
     const char *link_url;
     /** Optional short label for link_url. */
     const char *link_label;
+    /**
+     * Router event type behind this message, when it came from a router
+     * send_message action: "out_message" for a final agent reply,
+     * "agent_stage" for a progress notification, "message" for an inbound-echo
+     * acknowledgement. NULL for direct API sends. Lets observers act on only
+     * the kind they care about.
+     */
+    const char *event_type;
     int64_t timestamp_ms;
 } cap_im_local_message_t;
 

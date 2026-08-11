@@ -25,6 +25,7 @@
 #include "cap_im_local.h"
 #include "claw_cap.h"
 #include "claw_event_publisher.h"
+#include "claw_event_router.h"
 #include "voice_pipeline_private.h"
 
 static const char *TAG = "cap_voice_pipeline";
@@ -47,6 +48,10 @@ static const char *TAG = "cap_voice_pipeline";
 #define VOICE_CHAT_ID             "voice_user"
 #define VOICE_SENDER_ID           "voice_user"
 #define VOICE_SOURCE_CAP          "voice_gateway"
+/* Capability the router must use to deliver replies on VOICE_CHANNEL. */
+#define VOICE_OUTBOUND_CAP        "local_send_message"
+/* Router event type of a final agent reply, as opposed to a progress notice. */
+#define VOICE_EVENT_TYPE_REPLY    "out_message"
 
 typedef struct {
     SemaphoreHandle_t lock;
@@ -167,6 +172,16 @@ static esp_err_t on_agent_outbound_message_cb(const cap_im_local_message_t *mess
     }
     if (!s_voice.tts_queue) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Speak final agent replies only. The same delivery path also carries the
+     * "working on it" acknowledgement (event_type "message") and a
+     * notification per tool call (event_type "agent_stage"); reading those
+     * aloud would bury the answer under a running commentary. */
+    if (!message->event_type || strcmp(message->event_type, VOICE_EVENT_TYPE_REPLY) != 0) {
+        ESP_LOGD(TAG, "Not speaking event_type=%s",
+                 message->event_type ? message->event_type : "(none)");
+        return ESP_OK;
     }
 
     request.text = strdup(message->text);
@@ -477,6 +492,18 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
             ESP_LOGE(TAG, "Failed to register voice capability group: %s", esp_err_to_name(err));
             goto fail;
         }
+    }
+
+    /* Without this the router cannot resolve a delivery capability for
+     * VOICE_CHANNEL and every agent reply to a spoken question is dropped with
+     * "send_message resolve failed". app_claw binds the IM channels and "web",
+     * but nothing binds cap_im_local's own default channel. */
+    err = claw_event_router_register_outbound_binding(VOICE_CHANNEL, VOICE_OUTBOUND_CAP);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to bind '%s' to %s: %s", VOICE_CHANNEL, VOICE_OUTBOUND_CAP,
+                 esp_err_to_name(err));
+        claw_cap_unregister_group(s_voice_group.group_id, 0);
+        goto fail;
     }
 
     /* Observe (never replace) outbound replies so web chat keeps working. */

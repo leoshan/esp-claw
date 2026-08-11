@@ -28,6 +28,12 @@ static const char *TAG = "cap_im_local";
 #define CAP_IM_LOCAL_LINK_URL_STACK    256
 #define CAP_IM_LOCAL_LINK_LABEL_STACK  128
 #define CAP_IM_LOCAL_EMIT_COMBINED_MAX 8192
+#define CAP_IM_LOCAL_MAX_OUTBOUND_OBSERVERS 4
+
+typedef struct {
+    cap_im_local_outbound_callback_t callback;
+    void *user_ctx;
+} cap_im_local_observer_t;
 
 typedef struct {
     SemaphoreHandle_t lock;
@@ -37,6 +43,8 @@ typedef struct {
     char default_sender_id[96];
     cap_im_local_outbound_callback_t outbound_callback;
     void *outbound_callback_user_ctx;
+    cap_im_local_observer_t outbound_observers[CAP_IM_LOCAL_MAX_OUTBOUND_OBSERVERS];
+    size_t outbound_observer_count;
 } cap_im_local_state_t;
 
 static cap_im_local_state_t s_local = {
@@ -138,6 +146,8 @@ static esp_err_t cap_im_local_send_text_impl(const char *channel,
     cap_im_local_message_t message = {0};
     cap_im_local_outbound_callback_t callback = NULL;
     void *callback_user_ctx = NULL;
+    cap_im_local_observer_t observers[CAP_IM_LOCAL_MAX_OUTBOUND_OBSERVERS];
+    size_t observer_count = 0;
     char message_id_buf[CAP_IM_LOCAL_MESSAGE_ID_SIZE];
     char link_url_stack[CAP_IM_LOCAL_LINK_URL_STACK];
     char link_label_stack[CAP_IM_LOCAL_LINK_LABEL_STACK];
@@ -159,6 +169,8 @@ static esp_err_t cap_im_local_send_text_impl(const char *channel,
 
     callback = s_local.outbound_callback;
     callback_user_ctx = s_local.outbound_callback_user_ctx;
+    observer_count = s_local.outbound_observer_count;
+    memcpy(observers, s_local.outbound_observers, observer_count * sizeof(observers[0]));
 
     message.channel = (channel && channel[0]) ? channel : s_local.default_channel;
     message.chat_id = chat_id;
@@ -191,12 +203,27 @@ static esp_err_t cap_im_local_send_text_impl(const char *channel,
 
     cap_im_local_unlock();
 
-    if (!callback) {
+    if (!callback && observer_count == 0) {
         ESP_LOGW(TAG, "No outbound callback registered for local IM");
         return ESP_ERR_INVALID_STATE;
     }
 
-    return callback(&message, callback_user_ctx);
+    /* Primary callback owns delivery and its result is reported to the sender. */
+    err = callback ? callback(&message, callback_user_ctx) : ESP_OK;
+
+    /* Observers only tap the stream; their failures must not break delivery. */
+    for (size_t i = 0; i < observer_count; i++) {
+        esp_err_t observer_err = observers[i].callback(&message, observers[i].user_ctx);
+
+        if (observer_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Outbound observer %u failed: %s",
+                     (unsigned)i,
+                     esp_err_to_name(observer_err));
+        }
+    }
+
+    return err;
 }
 
 static esp_err_t cap_im_local_send_message_execute(const char *input_json,
@@ -345,6 +372,78 @@ esp_err_t cap_im_local_set_outbound_callback(cap_im_local_outbound_callback_t ca
     s_local.outbound_callback_user_ctx = user_ctx;
     cap_im_local_unlock();
     return ESP_OK;
+}
+
+esp_err_t cap_im_local_add_outbound_observer(cap_im_local_outbound_callback_t callback,
+                                             void *user_ctx)
+{
+    esp_err_t err;
+
+    if (!callback) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = cap_im_local_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (size_t i = 0; i < s_local.outbound_observer_count; i++) {
+        if (s_local.outbound_observers[i].callback == callback) {
+            s_local.outbound_observers[i].user_ctx = user_ctx;
+            cap_im_local_unlock();
+            return ESP_OK;
+        }
+    }
+
+    if (s_local.outbound_observer_count >= CAP_IM_LOCAL_MAX_OUTBOUND_OBSERVERS) {
+        cap_im_local_unlock();
+        ESP_LOGE(TAG,
+                 "Outbound observer table full (max %d)",
+                 CAP_IM_LOCAL_MAX_OUTBOUND_OBSERVERS);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_local.outbound_observers[s_local.outbound_observer_count].callback = callback;
+    s_local.outbound_observers[s_local.outbound_observer_count].user_ctx = user_ctx;
+    s_local.outbound_observer_count++;
+    cap_im_local_unlock();
+    return ESP_OK;
+}
+
+esp_err_t cap_im_local_remove_outbound_observer(cap_im_local_outbound_callback_t callback)
+{
+    esp_err_t err;
+
+    if (!callback) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = cap_im_local_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (size_t i = 0; i < s_local.outbound_observer_count; i++) {
+        if (s_local.outbound_observers[i].callback == callback) {
+            size_t remaining = s_local.outbound_observer_count - i - 1;
+
+            if (remaining > 0) {
+                memmove(&s_local.outbound_observers[i],
+                        &s_local.outbound_observers[i + 1],
+                        remaining * sizeof(s_local.outbound_observers[0]));
+            }
+            s_local.outbound_observer_count--;
+            memset(&s_local.outbound_observers[s_local.outbound_observer_count],
+                   0,
+                   sizeof(s_local.outbound_observers[0]));
+            cap_im_local_unlock();
+            return ESP_OK;
+        }
+    }
+
+    cap_im_local_unlock();
+    return ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t cap_im_local_start(void)

@@ -29,7 +29,9 @@
 #include "cap_im_wechat.h"
 #endif
 #include "app_config.h"
+#if CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED
 #include "cap_voice_pipeline.h"
+#endif
 
 #define APP_ENABLE_MEM_LOG        (0)
 
@@ -415,7 +417,17 @@ void app_main(void)
 #if CONFIG_APP_CLAW_CAP_IM_LOCAL
     ESP_ERROR_CHECK(http_server_webim_bind_im());
 #endif
-    cap_voice_pipeline_init(s_config);
+#if CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED
+    /* Voice is an optional I/O channel: log and continue when the audio
+     * hardware is absent or its pins are already claimed by another driver. */
+    {
+        esp_err_t voice_err = cap_voice_pipeline_init(s_config);
+
+        if (voice_err != ESP_OK) {
+            ESP_LOGW(TAG, "Voice pipeline unavailable: %s", esp_err_to_name(voice_err));
+        }
+    }
+#endif
 
     register_wifi_command();
 

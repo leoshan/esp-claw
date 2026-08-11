@@ -39,8 +39,33 @@ typedef struct {
 
 esp_err_t cap_im_local_register_group(void);
 esp_err_t cap_im_local_set_config(const cap_im_local_config_t *config);
+
+/**
+ * @brief Set the primary outbound delivery callback.
+ *
+ * Exactly one primary callback exists; a later call replaces the previous one.
+ * The primary callback owns delivery of the message and its return value is
+ * propagated to the sender. Use cap_im_local_add_outbound_observer() instead
+ * when a component only needs to observe outbound traffic.
+ */
 esp_err_t cap_im_local_set_outbound_callback(cap_im_local_outbound_callback_t callback,
                                              void *user_ctx);
+
+/**
+ * @brief Add a passive observer of outbound messages.
+ *
+ * Observers run after the primary callback and never replace it, so several
+ * components (web chat delivery, voice TTS playback, ...) can coexist.
+ * Observer return values are logged and discarded; they do not affect the
+ * result seen by the sender. Registering the same callback twice is a no-op.
+ */
+esp_err_t cap_im_local_add_outbound_observer(cap_im_local_outbound_callback_t callback,
+                                             void *user_ctx);
+
+/**
+ * @brief Remove a previously added outbound observer.
+ */
+esp_err_t cap_im_local_remove_outbound_observer(cap_im_local_outbound_callback_t callback);
 esp_err_t cap_im_local_start(void);
 esp_err_t cap_im_local_stop(void);
 esp_err_t cap_im_local_send_text(const char *channel,

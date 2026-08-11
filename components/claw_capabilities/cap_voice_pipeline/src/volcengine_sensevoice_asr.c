@@ -3,6 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include "sdkconfig.h"
+
+#if CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -10,9 +14,15 @@
 #include "esp_err.h"
 #include "esp_http_client.h"
 #include "cJSON.h"
-#include "app_config.h"
+
+#include "voice_pipeline_private.h"
 
 static const char *TAG = "volcengine_asr";
+
+#define ASR_DEFAULT_URL         "https://openspeech.bytedance.com/api/v1/asr"
+#define ASR_DEFAULT_RESOURCE_ID "volc.sensevoice.v1"
+#define ASR_SAMPLE_RATE         16000
+#define ASR_WAV_HEADER_SIZE     44
 
 typedef struct {
     char *data;
@@ -40,11 +50,11 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// Generate standard WAV header for 16kHz 16bit MONO PCM
+// Generate standard WAV header for 16-bit MONO PCM at ASR_SAMPLE_RATE
 static void generate_wav_header(uint8_t *header, uint32_t pcm_len)
 {
     uint32_t total_len = pcm_len + 36;
-    uint32_t sample_rate = 16000;
+    uint32_t sample_rate = ASR_SAMPLE_RATE;
     uint16_t channels = 1;
     uint16_t bits_per_sample = 16;
     uint32_t byte_rate = sample_rate * channels * (bits_per_sample / 8);
@@ -72,20 +82,23 @@ esp_err_t volcengine_sensevoice_asr_recognize(const app_config_t *config, const 
         return ESP_ERR_INVALID_ARG;
     }
 
-    const char *url = config->asr_base_url[0] ? config->asr_base_url : "https://openspeech.bytedance.com/api/v1/asr";
-    const char *resource_id = config->asr_resource_id[0] ? config->asr_resource_id : "volc.sensevoice.v1";
+    const char *url = config->asr_base_url[0] ? config->asr_base_url : ASR_DEFAULT_URL;
+    const char *resource_id = config->asr_resource_id[0] ? config->asr_resource_id : ASR_DEFAULT_RESOURCE_ID;
+    char *auth_hdr = NULL;
+
+    out_text[0] = '\0';
 
     ESP_LOGI(TAG, "Recognizing ASR using Volcengine SenseVoice API: %s (PCM size: %d bytes)", url, (int)pcm_len);
 
     // Build WAV payload in memory
-    size_t wav_len = pcm_len + 44;
+    size_t wav_len = pcm_len + ASR_WAV_HEADER_SIZE;
     uint8_t *wav_payload = malloc(wav_len);
     if (!wav_payload) {
         ESP_LOGE(TAG, "Failed to allocate WAV buffer");
         return ESP_ERR_NO_MEM;
     }
     generate_wav_header(wav_payload, pcm_len);
-    memcpy(wav_payload + 44, pcm_data, pcm_len);
+    memcpy(wav_payload + ASR_WAV_HEADER_SIZE, pcm_data, pcm_len);
 
     response_buffer_t resp_buf = {
         .data = malloc(2048),
@@ -116,8 +129,18 @@ esp_err_t volcengine_sensevoice_asr_recognize(const app_config_t *config, const 
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
 
     if (config->asr_api_key[0]) {
-        char auth_hdr[384];
-        snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", config->asr_api_key);
+        /* Kept off the task stack: the token alone can be APP_CONFIG_STR_LEN bytes. */
+        size_t auth_len = strlen(config->asr_api_key) + sizeof("Bearer;");
+
+        auth_hdr = malloc(auth_len);
+        if (!auth_hdr) {
+            esp_http_client_cleanup(client);
+            free(wav_payload);
+            free(resp_buf.data);
+            return ESP_ERR_NO_MEM;
+        }
+        /* Volcengine expects the "Bearer;" (semicolon) prefix, not "Bearer ". */
+        snprintf(auth_hdr, auth_len, "Bearer;%s", config->asr_api_key);
         esp_http_client_set_header(client, "Authorization", auth_hdr);
     }
     if (config->asr_app_id[0]) {
@@ -161,5 +184,8 @@ esp_err_t volcengine_sensevoice_asr_recognize(const app_config_t *config, const 
 
     esp_http_client_cleanup(client);
     free(resp_buf.data);
+    free(auth_hdr);
     return (out_text[0] != '\0') ? ESP_OK : ESP_FAIL;
 }
+
+#endif /* CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED */

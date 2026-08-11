@@ -10,8 +10,10 @@
  *
  *     {"code":0,"message":"OK","data":"<base64 pcm>"}
  *
- * Slices are decoded and pushed to the speaker as they arrive, so playback
- * starts early and memory stays flat no matter how long the sentence is.
+ * Slices are decoded into a PSRAM buffer and played only once the response
+ * ends. Feeding them to I2S on arrival sounds broken: the service emits audio
+ * at roughly half of real time, so the DMA runs dry between slices and every
+ * gap is an audible click.
  */
 #include "sdkconfig.h"
 
@@ -24,6 +26,7 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -45,6 +48,9 @@ static const char *TAG = "volcengine_tts";
 #define TTS_CODE_SUCCESS        20000000
 /* One JSON slice stays small; this only bounds a malformed reply. */
 #define TTS_SLICE_MAX_BYTES (128 * 1024)
+/* Ceiling on buffered audio: 60 s at 24 kHz 16-bit mono is under 3 MB, which
+ * fits PSRAM comfortably while bounding a runaway response. */
+#define TTS_PCM_MAX_BYTES (24000 * 2 * 60)
 
 #define TTS_ERROR_SNIPPET_LEN 200
 
@@ -55,6 +61,13 @@ typedef struct {
     bool overflow;
     esp_err_t play_err;
     size_t total_pcm;
+    /* Decoded audio, accumulated until the response ends. The service emits
+     * slices slower than real time (measured ~40-60% of playback rate), so
+     * writing them to I2S as they arrive starves the DMA between slices and
+     * every gap is audible as a click. */
+    uint8_t *pcm;
+    size_t pcm_len;
+    size_t pcm_capacity;
     /* First bytes of the raw body, kept NUL-terminated for error reporting.
      * buf cannot be used for this: complete objects are consumed out of it. */
     char error_snippet[TTS_ERROR_SNIPPET_LEN + 1];
@@ -64,6 +77,14 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* Playback                                                            */
 /* ------------------------------------------------------------------ */
+
+/** Prefer PSRAM for the audio buffer; a long reply is megabytes. */
+static void *tts_alloc(size_t size)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    return ptr ? ptr : malloc(size);
+}
 
 static esp_err_t tts_play_pcm(const uint8_t *pcm, size_t pcm_len)
 {
@@ -88,7 +109,47 @@ static esp_err_t tts_play_pcm(const uint8_t *pcm, size_t pcm_len)
     return ESP_OK;
 }
 
-/** Decode one `{"code":..,"data":"..."}` object and play its audio slice. */
+/** Append one decoded slice to the playback buffer, growing it in PSRAM. */
+static esp_err_t tts_pcm_append(tts_stream_t *stream, const uint8_t *pcm, size_t len)
+{
+    if (len == 0) {
+        return ESP_OK;
+    }
+    if (stream->pcm_len + len > TTS_PCM_MAX_BYTES) {
+        ESP_LOGE(TAG, "Synthesized audio exceeds %d bytes; truncating", TTS_PCM_MAX_BYTES);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (stream->pcm_len + len > stream->pcm_capacity) {
+        size_t new_cap = stream->pcm_capacity ? stream->pcm_capacity * 2 : (128 * 1024);
+
+        while (new_cap < stream->pcm_len + len) {
+            new_cap *= 2;
+        }
+        if (new_cap > TTS_PCM_MAX_BYTES) {
+            new_cap = TTS_PCM_MAX_BYTES;
+        }
+
+        uint8_t *grown = tts_alloc(new_cap);
+        if (!grown) {
+            ESP_LOGE(TAG, "Failed to grow audio buffer to %u bytes", (unsigned)new_cap);
+            return ESP_ERR_NO_MEM;
+        }
+        if (stream->pcm_len > 0) {
+            memcpy(grown, stream->pcm, stream->pcm_len);
+        }
+        free(stream->pcm);
+        stream->pcm = grown;
+        stream->pcm_capacity = new_cap;
+    }
+
+    memcpy(stream->pcm + stream->pcm_len, pcm, len);
+    stream->pcm_len += len;
+    stream->total_pcm += len;
+    return ESP_OK;
+}
+
+/** Decode one `{"code":..,"data":"..."}` object into the playback buffer. */
 static esp_err_t tts_consume_object(tts_stream_t *stream, const char *json, size_t json_len)
 {
     cJSON *root = cJSON_ParseWithLength(json, json_len);
@@ -148,8 +209,7 @@ static esp_err_t tts_consume_object(tts_stream_t *stream, const char *json, size
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    err = tts_play_pcm(pcm, pcm_len);
-    stream->total_pcm += pcm_len;
+    err = tts_pcm_append(stream, pcm, pcm_len);
     free(pcm);
     return err;
 }
@@ -382,13 +442,19 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
             err = ESP_FAIL;
         } else if (stream.play_err != ESP_OK) {
             err = stream.play_err;
-        } else if (stream.total_pcm == 0) {
+        } else if (stream.pcm_len == 0) {
             ESP_LOGE(TAG, "TTS returned no audio");
             err = ESP_ERR_INVALID_RESPONSE;
         } else {
-            ESP_LOGI(TAG, "Played %u bytes of PCM (~%u ms)", (unsigned)stream.total_pcm,
-                     (unsigned)(stream.total_pcm * 1000 /
-                                (size_t)(voice_audio_io_get_speaker_sample_rate() * 2)));
+            unsigned duration_ms =
+                (unsigned)(stream.pcm_len * 1000 /
+                           (size_t)(voice_audio_io_get_speaker_sample_rate() * 2));
+
+            /* Play only now that the whole utterance is in hand, so the I2S
+             * DMA is fed back to back instead of stalling between slices. */
+            ESP_LOGI(TAG, "Playing %u bytes of PCM (~%u ms)", (unsigned)stream.pcm_len,
+                     duration_ms);
+            err = tts_play_pcm(stream.pcm, stream.pcm_len);
         }
     } else {
         ESP_LOGE(TAG, "TTS HTTP perform failed: %s", esp_err_to_name(err));
@@ -396,6 +462,7 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
 
     esp_http_client_cleanup(client);
     free(stream.buf);
+    free(stream.pcm);
     free(api_key_header);
     free(json_body);
     return err;

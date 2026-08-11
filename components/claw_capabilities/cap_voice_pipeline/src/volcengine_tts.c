@@ -41,6 +41,8 @@ static const char *TAG = "volcengine_tts";
 #define TTS_DEFAULT_SPEAKER     "zh_female_vv_uranus_bigtts"
 #define TTS_HTTP_TIMEOUT_MS     20000
 #define TTS_WRITE_TIMEOUT_MS    2000
+/* ~170 ms of 24 kHz 16-bit mono, an order of magnitude under the timeout. */
+#define TTS_WRITE_CHUNK_BYTES   8192
 /* Success codes. The API reference prints "code": 0 in its example, but the
  * live service sends 20000000 ("成功" in the shared Volcengine speech error
  * code table) alongside "message":"OK". Accept both. */
@@ -90,18 +92,26 @@ static esp_err_t tts_play_pcm(const uint8_t *pcm, size_t pcm_len)
 {
     size_t offset = 0;
 
+    /* Hand the driver one small chunk at a time. i2s_channel_write only
+     * returns once the whole request has been queued, which takes as long as
+     * that audio lasts, so passing the entire utterance would blow past any
+     * sane timeout. TTS_WRITE_CHUNK_BYTES is a fraction of a second, leaving
+     * the timeout to catch a genuinely stuck channel. */
     while (offset < pcm_len) {
+        size_t remaining = pcm_len - offset;
+        size_t chunk = remaining < TTS_WRITE_CHUNK_BYTES ? remaining : TTS_WRITE_CHUNK_BYTES;
         size_t written = 0;
-        esp_err_t err = voice_audio_io_write(pcm + offset, pcm_len - offset, &written,
+        esp_err_t err = voice_audio_io_write(pcm + offset, chunk, &written,
                                              TTS_WRITE_TIMEOUT_MS);
 
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Speaker write failed after %u bytes: %s", (unsigned)offset,
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "Speaker write failed after %u/%u bytes: %s", (unsigned)offset,
+                     (unsigned)pcm_len, esp_err_to_name(err));
             return err;
         }
         if (written == 0) {
-            ESP_LOGE(TAG, "Speaker stalled after %u bytes", (unsigned)offset);
+            ESP_LOGE(TAG, "Speaker stalled after %u/%u bytes", (unsigned)offset,
+                     (unsigned)pcm_len);
             return ESP_ERR_TIMEOUT;
         }
         offset += written;
@@ -455,6 +465,9 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
             ESP_LOGI(TAG, "Playing %u bytes of PCM (~%u ms)", (unsigned)stream.pcm_len,
                      duration_ms);
             err = tts_play_pcm(stream.pcm, stream.pcm_len);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Playback finished");
+            }
         }
     } else {
         ESP_LOGE(TAG, "TTS HTTP perform failed: %s", esp_err_to_name(err));

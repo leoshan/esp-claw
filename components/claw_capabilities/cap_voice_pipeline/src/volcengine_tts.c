@@ -38,6 +38,11 @@ static const char *TAG = "volcengine_tts";
 #define TTS_DEFAULT_SPEAKER     "zh_female_vv_uranus_bigtts"
 #define TTS_HTTP_TIMEOUT_MS     20000
 #define TTS_WRITE_TIMEOUT_MS    2000
+/* Success codes. The API reference prints "code": 0 in its example, but the
+ * live service sends 20000000 ("成功" in the shared Volcengine speech error
+ * code table) alongside "message":"OK". Accept both. */
+#define TTS_CODE_OK             0
+#define TTS_CODE_SUCCESS        20000000
 /* One JSON slice stays small; this only bounds a malformed reply. */
 #define TTS_SLICE_MAX_BYTES (128 * 1024)
 
@@ -106,7 +111,8 @@ static esp_err_t tts_consume_object(tts_stream_t *stream, const char *json, size
     }
 
     code = cJSON_GetObjectItem(root, "code");
-    if (cJSON_IsNumber(code) && code->valueint != 0) {
+    if (cJSON_IsNumber(code) && code->valueint != TTS_CODE_OK &&
+        code->valueint != TTS_CODE_SUCCESS) {
         cJSON *message = cJSON_GetObjectItem(root, "message");
 
         ESP_LOGE(TAG, "TTS service returned code=%d message=%s", code->valueint,

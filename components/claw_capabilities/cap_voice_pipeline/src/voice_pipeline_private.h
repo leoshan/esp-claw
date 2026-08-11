@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,38 +17,57 @@
 extern "C" {
 #endif
 
+/* Board-manager peripheral names declared in board_peripherals.yaml. */
+#define VOICE_PERIPH_MIC     "i2s_audio_in"
+#define VOICE_PERIPH_SPEAKER "i2s_audio_out"
+
+/* The ASR service only accepts 16 kHz 16-bit mono PCM. */
+#define VOICE_ASR_SAMPLE_RATE 16000
+#define VOICE_ASR_BITS        16
+#define VOICE_ASR_CHANNELS    1
+
 /**
- * @brief Bring up the I2S RX (microphone) and TX (speaker) channels.
+ * @brief Bind to the board-managed I2S microphone and speaker channels.
  *
- * @param hw Pin and sample-rate configuration; must stay valid only for the
- *           duration of the call.
+ * The channels are created and enabled by the board manager from
+ * board_peripherals.yaml, so this only looks up the handles. Nothing here
+ * touches GPIOs, which is what makes pin conflicts structurally impossible.
  */
-esp_err_t i2s_audio_driver_init(const cap_voice_hardware_config_t *hw);
+esp_err_t voice_audio_io_init(void);
+
+/** @brief Drop the borrowed channel handles. The board manager owns them. */
+void voice_audio_io_deinit(void);
+
+esp_err_t voice_audio_io_read(void *dest, size_t size, size_t *bytes_read, uint32_t timeout_ms);
+
+esp_err_t voice_audio_io_write(const void *src, size_t size, size_t *bytes_written,
+                               uint32_t timeout_ms);
+
+/** @brief Sample rate the board configured the speaker channel with, in Hz. */
+int voice_audio_io_get_speaker_sample_rate(void);
+
+/** @brief Sample rate the board configured the microphone channel with, in Hz. */
+int voice_audio_io_get_mic_sample_rate(void);
 
 /**
- * @brief Release both I2S channels allocated by i2s_audio_driver_init().
- */
-esp_err_t i2s_audio_driver_deinit(void);
-
-esp_err_t i2s_audio_driver_read(void *dest, size_t size, size_t *bytes_read, uint32_t timeout_ms);
-
-esp_err_t i2s_audio_driver_write(const void *src, size_t size, size_t *bytes_written,
-                                 uint32_t timeout_ms);
-
-/**
- * @brief Send PCM audio to the Volcengine SenseVoice ASR endpoint.
+ * @brief Pull one utterance through the streaming ASR service.
  *
- * @param out_text     Caller-owned buffer receiving the recognized text.
- * @param max_text_len Size of @p out_text in bytes.
+ * Opens a WebSocket to the Volcengine streaming ASR endpoint, streams PCM read
+ * from the microphone until @p should_continue returns false or the recording
+ * cap is reached, then returns the final transcript.
+ *
+ * @param config          Application config supplying the API key and endpoint.
+ * @param should_continue Polled between packets; return false to stop early.
+ * @param out_text        Caller-owned buffer receiving the recognized text.
+ * @param max_text_len    Size of @p out_text in bytes.
  */
-esp_err_t volcengine_sensevoice_asr_recognize(const app_config_t *config,
-                                              const uint8_t *pcm_data,
-                                              size_t pcm_len,
-                                              char *out_text,
-                                              size_t max_text_len);
+esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
+                                          bool (*should_continue)(void),
+                                          char *out_text,
+                                          size_t max_text_len);
 
 /**
- * @brief Synthesize @p text through Volcengine TTS and play it on the speaker.
+ * @brief Synthesize @p text and stream it straight to the speaker.
  */
 esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text);
 

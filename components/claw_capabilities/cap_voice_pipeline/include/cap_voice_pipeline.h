@@ -15,26 +15,12 @@ extern "C" {
 #endif
 
 /**
- * @brief I2S pin and sample-rate configuration for the voice pipeline.
+ * @brief Initialize the voice pipeline: bind to the board-managed I2S
+ *        microphone and speaker, register the `voice_listen` / `voice_speak`
+ *        capabilities, and subscribe to outbound agent replies for TTS.
  *
- * Populated from Kconfig by cap_voice_pipeline_init(); boards that need
- * different wiring override the CLAW_CAP_VOICE_* options in sdkconfig.
- */
-typedef struct {
-    int mic_ws_pin;
-    int mic_sck_pin;
-    int mic_din_pin;
-    int spk_dout_pin;
-    int spk_bclk_pin;
-    int spk_lrck_pin;
-    int sample_rate_input;
-    int sample_rate_output;
-} cap_voice_hardware_config_t;
-
-/**
- * @brief Initialize the voice pipeline: bring up I2S, register the
- *        `voice_listen` / `voice_speak` capabilities, and subscribe to
- *        outbound agent replies for TTS playback.
+ * Audio pins come from the board's `i2s_audio_in` / `i2s_audio_out` entries in
+ * board_peripherals.yaml, so this capability never touches GPIOs itself.
  *
  * @param config Application config providing ASR/TTS credentials. Must remain
  *               valid for the lifetime of the capability.

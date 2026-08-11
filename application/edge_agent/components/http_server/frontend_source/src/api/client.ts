@@ -39,15 +39,11 @@ export type AppConfig = {
   llm_visible_cap_groups: string;
   enabled_lua_modules: string;
   time_timezone: string;
-  asr_provider: string;
-  asr_api_key: string;
-  asr_app_id: string;
+  voice_api_key: string;
   asr_resource_id: string;
   asr_base_url: string;
-  tts_provider: string;
-  tts_api_key: string;
-  tts_app_id: string;
-  tts_voice_type: string;
+  tts_resource_id: string;
+  tts_speaker: string;
   tts_base_url: string;
 };
 
@@ -88,15 +84,11 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
   voice: [
-    'asr_provider',
-    'asr_api_key',
-    'asr_app_id',
+    'voice_api_key',
     'asr_resource_id',
     'asr_base_url',
-    'tts_provider',
-    'tts_api_key',
-    'tts_app_id',
-    'tts_voice_type',
+    'tts_resource_id',
+    'tts_speaker',
     'tts_base_url',
   ],
 };

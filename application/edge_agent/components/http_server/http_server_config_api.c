@@ -77,15 +77,11 @@ static const config_field_def_t CONFIG_FIELDS[] = {
 
     CONFIG_FIELD("time",         time_timezone),
 
-    CONFIG_FIELD("voice",        asr_provider),
-    CONFIG_FIELD("voice",        asr_api_key),
-    CONFIG_FIELD("voice",        asr_app_id),
+    CONFIG_FIELD("voice",        voice_api_key),
     CONFIG_FIELD("voice",        asr_resource_id),
     CONFIG_FIELD("voice",        asr_base_url),
-    CONFIG_FIELD("voice",        tts_provider),
-    CONFIG_FIELD("voice",        tts_api_key),
-    CONFIG_FIELD("voice",        tts_app_id),
-    CONFIG_FIELD("voice",        tts_voice_type),
+    CONFIG_FIELD("voice",        tts_resource_id),
+    CONFIG_FIELD("voice",        tts_speaker),
     CONFIG_FIELD("voice",        tts_base_url),
 };
 

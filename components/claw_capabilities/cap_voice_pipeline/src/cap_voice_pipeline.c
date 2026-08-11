@@ -15,9 +15,9 @@
 
 #include "cJSON.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -30,16 +30,18 @@
 static const char *TAG = "cap_voice_pipeline";
 
 #define VOICE_RECORD_DURATION_SEC CONFIG_CLAW_CAP_VOICE_RECORD_DURATION_SEC
-#define VOICE_MIC_SAMPLE_RATE     CONFIG_CLAW_CAP_VOICE_MIC_SAMPLE_RATE
-#define VOICE_SPK_SAMPLE_RATE     CONFIG_CLAW_CAP_VOICE_SPK_SAMPLE_RATE
-/** 16-bit mono capture: 2 bytes per sample. */
-#define VOICE_RECORD_BUFFER_SIZE  (VOICE_MIC_SAMPLE_RATE * 2 * VOICE_RECORD_DURATION_SEC)
-#define VOICE_READ_CHUNK_BYTES    1024
-#define VOICE_READ_TIMEOUT_MS     200
 #define VOICE_ASR_TEXT_MAX        512
-#define VOICE_RECORD_TASK_STACK   6144
+/* The ASR client owns a WebSocket, TLS session and PCM packet buffer. */
+#define VOICE_RECORD_TASK_STACK   8192
 #define VOICE_RECORD_TASK_PRIO    5
 #define VOICE_LOCK_TIMEOUT_MS     1000
+/* Long enough to outlast an in-flight utterance rather than talk over it. */
+#define VOICE_PLAYBACK_LOCK_TIMEOUT_MS 30000
+#define VOICE_TTS_QUEUE_DEPTH     4
+#define VOICE_TTS_TASK_STACK      8192
+#define VOICE_TTS_TASK_PRIO       5
+/* Bound on how long deinit waits for the capture and playback tasks. */
+#define VOICE_DEINIT_WAIT_MS      5000
 #define VOICE_CAP_GROUP_ID        "cap_voice_pipeline"
 #define VOICE_CHANNEL             "local"
 #define VOICE_CHAT_ID             "voice_user"
@@ -48,11 +50,23 @@ static const char *TAG = "cap_voice_pipeline";
 
 typedef struct {
     SemaphoreHandle_t lock;
-    const app_config_t *config;
+    /* Serializes speaker access: agent replies and voice_speak tool calls
+     * arrive on different tasks and must not interleave on the I2S channel. */
+    SemaphoreHandle_t playback_lock;
+    /* Owned copy. main.c frees the app_config_t it passes to init() at the end
+     * of app_main, so holding the pointer would be a use-after-free. */
+    app_config_t config;
+    QueueHandle_t tts_queue;
+    TaskHandle_t tts_task;
     bool initialized;
     bool listening;
     TaskHandle_t record_task;
 } voice_pipeline_state_t;
+
+/** One queued sentence to speak. */
+typedef struct {
+    char *text;
+} voice_tts_request_t;
 
 static voice_pipeline_state_t s_voice = {0};
 
@@ -91,46 +105,82 @@ bool cap_voice_pipeline_is_listening(void)
     return voice_is_listening_locked_read();
 }
 
-/** Allocate from PSRAM when available, falling back to internal RAM. */
-static void *voice_alloc(size_t size)
-{
-    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    return ptr ? ptr : malloc(size);
-}
-
 /* ------------------------------------------------------------------ */
 /* Outbound agent reply -> TTS                                         */
 /* ------------------------------------------------------------------ */
+
+/** Synthesize and play one sentence, serialized against other speakers. */
+static esp_err_t voice_speak_locked(const char *text)
+{
+    esp_err_t err;
+
+    if (!s_voice.playback_lock) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_voice.playback_lock, pdMS_TO_TICKS(VOICE_PLAYBACK_LOCK_TIMEOUT_MS)) !=
+        pdTRUE) {
+        ESP_LOGW(TAG, "Speaker busy, dropping utterance");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    err = volcengine_tts_speak(&s_voice.config, text);
+    xSemaphoreGive(s_voice.playback_lock);
+    return err;
+}
+
+/** Drains queued agent replies so no caller blocks on network + playback. */
+static void voice_tts_task(void *pvParameters)
+{
+    voice_tts_request_t request;
+
+    (void)pvParameters;
+
+    while (xQueueReceive(s_voice.tts_queue, &request, portMAX_DELAY) == pdTRUE) {
+        if (!request.text) {
+            break; /* Sentinel posted by deinit. */
+        }
+        ESP_LOGI(TAG, "Speaking agent reply: '%.60s%s'", request.text,
+                 strlen(request.text) > 60 ? "..." : "");
+        voice_speak_locked(request.text);
+        free(request.text);
+    }
+
+    s_voice.tts_task = NULL;
+    vTaskDelete(NULL);
+}
 
 /**
  * Observer registered with cap_im_local. Runs after the primary delivery
  * callback (the web chat page), so agent replies still reach every other
  * channel while also being spoken aloud.
+ *
+ * Only queues the text: synthesis plus playback takes seconds, and this runs
+ * on the task that delivers agent replies to every channel.
  */
 static esp_err_t on_agent_outbound_message_cb(const cap_im_local_message_t *message, void *user_ctx)
 {
-    const app_config_t *config;
+    voice_tts_request_t request;
 
     (void)user_ctx;
     if (!message || !message->text || message->text[0] == '\0') {
         return ESP_OK;
     }
-
-    if (voice_lock() != ESP_OK) {
-        return ESP_ERR_TIMEOUT;
-    }
-    config = s_voice.config;
-    voice_unlock();
-
-    if (!config) {
+    if (!s_voice.tts_queue) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Agent reply received, synthesizing TTS: '%.60s%s'", message->text,
-             strlen(message->text) > 60 ? "..." : "");
+    request.text = strdup(message->text);
+    if (!request.text) {
+        return ESP_ERR_NO_MEM;
+    }
 
-    return volcengine_tts_speak(config, message->text);
+    if (xQueueSend(s_voice.tts_queue, &request, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "TTS queue full, dropping reply");
+        free(request.text);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -155,61 +205,34 @@ static void voice_publish_recognized_text(const char *text)
 
 static void voice_record_asr_task(void *pvParameters)
 {
-    const app_config_t *config;
-    uint8_t *pcm_buffer;
     char *text_out;
-    size_t total_read = 0;
 
     (void)pvParameters;
     ESP_LOGI(TAG, "Voice capture started (max %d s)", VOICE_RECORD_DURATION_SEC);
 
-    if (voice_lock() == ESP_OK) {
-        config = s_voice.config;
-        voice_unlock();
-    } else {
-        config = NULL;
-    }
-
-    pcm_buffer = voice_alloc(VOICE_RECORD_BUFFER_SIZE);
     /* Kept off the task stack: 512 bytes far exceeds the 128-byte stack budget. */
     text_out = calloc(1, VOICE_ASR_TEXT_MAX);
-
-    if (!pcm_buffer || !text_out) {
-        ESP_LOGE(TAG, "Failed to allocate capture buffers");
+    if (!text_out) {
+        ESP_LOGE(TAG, "Failed to allocate transcript buffer");
         goto cleanup;
     }
 
-    while (voice_is_listening_locked_read() && total_read < VOICE_RECORD_BUFFER_SIZE) {
-        size_t bytes_read = 0;
-        size_t chunk_to_read = VOICE_READ_CHUNK_BYTES;
-
-        if (total_read + chunk_to_read > VOICE_RECORD_BUFFER_SIZE) {
-            chunk_to_read = VOICE_RECORD_BUFFER_SIZE - total_read;
-        }
-
-        if (i2s_audio_driver_read(pcm_buffer + total_read, chunk_to_read, &bytes_read,
-                                  VOICE_READ_TIMEOUT_MS) == ESP_OK) {
-            total_read += bytes_read;
-        }
-    }
-
-    ESP_LOGI(TAG, "Captured %u bytes of PCM, running SenseVoice ASR", (unsigned)total_read);
-
-    if (config && total_read > 0) {
-        esp_err_t asr_err = volcengine_sensevoice_asr_recognize(config, pcm_buffer, total_read,
-                                                                text_out, VOICE_ASR_TEXT_MAX);
+    {
+        /* The ASR client streams microphone PCM as it is captured and stops
+         * when the listening flag clears, so no full-utterance buffer exists. */
+        esp_err_t asr_err = volcengine_asr_stream_recognize(
+            &s_voice.config, voice_is_listening_locked_read, text_out, VOICE_ASR_TEXT_MAX);
 
         if (asr_err == ESP_OK && text_out[0] != '\0') {
             ESP_LOGI(TAG, "ASR result: '%s'", text_out);
             voice_publish_recognized_text(text_out);
         } else {
-            ESP_LOGW(TAG, "ASR recognition failed or no speech detected");
-            volcengine_tts_speak(config, "未能识别到说话内容");
+            ESP_LOGW(TAG, "ASR recognition failed or no speech detected: %s",
+                     esp_err_to_name(asr_err));
         }
     }
 
 cleanup:
-    free(pcm_buffer);
     free(text_out);
 
     if (voice_lock() == ESP_OK) {
@@ -270,22 +293,13 @@ esp_err_t cap_voice_pipeline_stop_listening(void)
 
 esp_err_t cap_voice_pipeline_speak(const char *text)
 {
-    const app_config_t *config;
-
     if (!text || text[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
-
-    if (voice_lock() != ESP_OK) {
-        return ESP_ERR_TIMEOUT;
-    }
-    config = s_voice.config;
-    voice_unlock();
-
-    if (!config) {
+    if (!s_voice.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    return volcengine_tts_speak(config, text);
+    return voice_speak_locked(text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -412,16 +426,6 @@ static const claw_cap_group_t s_voice_group = {
 
 esp_err_t cap_voice_pipeline_init(const app_config_t *config)
 {
-    const cap_voice_hardware_config_t hw = {
-        .mic_ws_pin = CONFIG_CLAW_CAP_VOICE_MIC_GPIO_WS,
-        .mic_sck_pin = CONFIG_CLAW_CAP_VOICE_MIC_GPIO_SCK,
-        .mic_din_pin = CONFIG_CLAW_CAP_VOICE_MIC_GPIO_DIN,
-        .spk_dout_pin = CONFIG_CLAW_CAP_VOICE_SPK_GPIO_DOUT,
-        .spk_bclk_pin = CONFIG_CLAW_CAP_VOICE_SPK_GPIO_BCLK,
-        .spk_lrck_pin = CONFIG_CLAW_CAP_VOICE_SPK_GPIO_LRCK,
-        .sample_rate_input = VOICE_MIC_SAMPLE_RATE,
-        .sample_rate_output = VOICE_SPK_SAMPLE_RATE,
-    };
     esp_err_t err;
 
     if (!config) {
@@ -435,19 +439,35 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
 
     if (!s_voice.lock) {
         s_voice.lock = xSemaphoreCreateMutex();
-        if (!s_voice.lock) {
-            ESP_LOGE(TAG, "Failed to create voice pipeline lock");
-            return ESP_ERR_NO_MEM;
-        }
+    }
+    if (!s_voice.playback_lock) {
+        s_voice.playback_lock = xSemaphoreCreateMutex();
+    }
+    if (!s_voice.tts_queue) {
+        s_voice.tts_queue = xQueueCreate(VOICE_TTS_QUEUE_DEPTH, sizeof(voice_tts_request_t));
+    }
+    if (!s_voice.lock || !s_voice.playback_lock || !s_voice.tts_queue) {
+        ESP_LOGE(TAG, "Failed to create voice pipeline sync primitives");
+        err = ESP_ERR_NO_MEM;
+        goto fail;
     }
 
-    err = i2s_audio_driver_init(&hw);
+    err = voice_audio_io_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize I2S audio driver: %s", esp_err_to_name(err));
-        return err;
+        ESP_LOGE(TAG, "Failed to bind board audio peripherals: %s", esp_err_to_name(err));
+        goto fail;
     }
 
-    s_voice.config = config;
+    /* Own a copy: main.c frees the app_config_t it hands us at the end of
+     * app_main, so every later credential read would hit freed memory. */
+    memcpy(&s_voice.config, config, sizeof(s_voice.config));
+
+    if (xTaskCreate(voice_tts_task, "v_tts", VOICE_TTS_TASK_STACK, NULL, VOICE_TTS_TASK_PRIO,
+                    &s_voice.tts_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create TTS playback task");
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
 
     /* Expose listen/speak so the router, Lua scripts, console and LLM can all
      * drive the pipeline; without this the ASR path would be unreachable. */
@@ -472,8 +492,14 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
     return ESP_OK;
 
 fail:
-    s_voice.config = NULL;
-    i2s_audio_driver_deinit();
+    if (s_voice.tts_task) {
+        voice_tts_request_t stop = {.text = NULL};
+
+        xQueueSend(s_voice.tts_queue, &stop, pdMS_TO_TICKS(100));
+        s_voice.tts_task = NULL;
+    }
+    memset(&s_voice.config, 0, sizeof(s_voice.config));
+    voice_audio_io_deinit();
     return err;
 }
 
@@ -487,15 +513,27 @@ esp_err_t cap_voice_pipeline_deinit(void)
     claw_cap_unregister_group(s_voice_group.group_id, 0);
 
     cap_voice_pipeline_stop_listening();
-    /* Let the capture task observe the flag and exit before tearing down I2S. */
-    while (voice_is_listening_locked_read()) {
+    /* Let the capture task observe the flag and exit before tearing down I2S.
+     * Bounded so a wedged capture cannot hang shutdown forever. */
+    for (int waited_ms = 0; voice_is_listening_locked_read() && waited_ms < VOICE_DEINIT_WAIT_MS;
+         waited_ms += 50) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    i2s_audio_driver_deinit();
+    if (s_voice.tts_task) {
+        voice_tts_request_t stop = {.text = NULL};
+
+        xQueueSend(s_voice.tts_queue, &stop, pdMS_TO_TICKS(100));
+        for (int waited_ms = 0; s_voice.tts_task && waited_ms < VOICE_DEINIT_WAIT_MS;
+             waited_ms += 50) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    voice_audio_io_deinit();
 
     if (voice_lock() == ESP_OK) {
-        s_voice.config = NULL;
+        memset(&s_voice.config, 0, sizeof(s_voice.config));
         s_voice.initialized = false;
         voice_unlock();
     }

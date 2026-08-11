@@ -4,72 +4,33 @@ config CLAW_CAP_VOICE_PIPELINE_ENABLED
     bool "Enable Voice Pipeline Capability"
     default n
     help
-        Enables the I2S hardware audio pipeline with Volcengine SenseVoice ASR
-        and TTS.
+        Streaming speech-to-text and text-to-speech through the Volcengine
+        (Doubao) voice services.
 
-        This capability drives I2S directly on the pins configured below and
-        does not go through the board manager / esp_codec_dev abstraction, so
-        it must only be enabled on boards whose pins are known to be free, and
-        the pins below must be set to match the actual wiring.
-
-        Known conflict: on esp32_S3_DevKitC_1_breadboard the board profile
-        already claims GPIO 4/5 (LCD SPI clock and MOSI), 6 (LCD reset),
-        7 (LCD D/C), 15 (LCD CS), 16 (LCD backlight PWM) and 9 (PDM audio out
-        on I2S controller 0). Enabling this capability with the defaults on
-        that board takes the display's pins away from it.
+        Audio pins are NOT configured here. The capability binds to the
+        board's `i2s_audio_in` (microphone) and `i2s_audio_out` (speaker)
+        peripherals declared in board_peripherals.yaml, so it only works on
+        boards that declare both, and it can never conflict with pins the
+        board assigns to other peripherals.
 
 if CLAW_CAP_VOICE_PIPELINE_ENABLED
 
-comment "Microphone (I2S RX) pins"
-
-config CLAW_CAP_VOICE_MIC_GPIO_WS
-    int "Microphone I2S WS (LRCK) GPIO"
-    default 4
-
-config CLAW_CAP_VOICE_MIC_GPIO_SCK
-    int "Microphone I2S SCK (BCLK) GPIO"
-    default 5
-
-config CLAW_CAP_VOICE_MIC_GPIO_DIN
-    int "Microphone I2S DIN GPIO"
-    default 6
-
-config CLAW_CAP_VOICE_MIC_SAMPLE_RATE
-    int "Microphone capture sample rate (Hz)"
-    default 16000
-    help
-        Must match the sample rate declared in the WAV header sent to the ASR
-        service.
-
-comment "Speaker (I2S TX) pins"
-
-config CLAW_CAP_VOICE_SPK_GPIO_DOUT
-    int "Speaker I2S DOUT GPIO"
-    default 7
-
-config CLAW_CAP_VOICE_SPK_GPIO_BCLK
-    int "Speaker I2S BCLK GPIO"
-    default 15
-
-config CLAW_CAP_VOICE_SPK_GPIO_LRCK
-    int "Speaker I2S LRCK (WS) GPIO"
-    default 16
-
-config CLAW_CAP_VOICE_SPK_SAMPLE_RATE
+config CLAW_CAP_VOICE_SPEAKER_SAMPLE_RATE
     int "Speaker playback sample rate (Hz)"
     default 24000
     help
-        Must match the sample rate requested from the TTS service.
-
-comment "Recording behaviour"
+        Must match the sample_rate_hz of the board's i2s_audio_out peripheral.
+        The TTS service is asked to synthesize at exactly this rate so the
+        firmware never has to resample.
 
 config CLAW_CAP_VOICE_RECORD_DURATION_SEC
-    int "Maximum recording duration per utterance (seconds)"
-    default 4
-    range 1 15
+    int "Maximum capture duration per utterance (seconds)"
+    default 8
+    range 1 30
     help
-        The PCM capture buffer is sized from this value:
-        sample_rate * 2 bytes * duration. Four seconds at 16 kHz is 128 KB.
+        Upper bound on how long one voice_listen call keeps streaming audio to
+        the recognizer before it forces the final packet. Audio is streamed as
+        it is captured, so this does not size any buffer.
 
 endif
 

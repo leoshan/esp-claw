@@ -2,6 +2,16 @@
  * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Volcengine "单向流式语音合成" (unidirectional streaming TTS) over HTTP.
+ *
+ * POST /api/v3/tts/unidirectional answers with an HTTP chunked body carrying a
+ * sequence of JSON objects, each holding one base64 slice of audio:
+ *
+ *     {"code":0,"message":"OK","data":"<base64 pcm>"}
+ *
+ * Slices are decoded and pushed to the speaker as they arrive, so playback
+ * starts early and memory stays flat no matter how long the sentence is.
  */
 #include "sdkconfig.h"
 
@@ -12,134 +22,73 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "mbedtls/base64.h"
 
 #include "voice_pipeline_private.h"
 
 static const char *TAG = "volcengine_tts";
 
-#define TTS_DEFAULT_URL        "https://openspeech.bytedance.com/api/v1/tts"
-#define TTS_DEFAULT_VOICE_TYPE "BV001_streaming"
-#define TTS_DEFAULT_CLUSTER    "volcano_tts"
-#define TTS_SAMPLE_RATE        24000
-/** Volcengine returns code 3000 on successful synthesis. */
-#define TTS_SUCCESS_CODE       3000
-#define TTS_RESP_INITIAL_CAP   (16 * 1024)
-/** Guard against a runaway response; 512 KB of base64 is ~6 s of 24 kHz PCM. */
-#define TTS_RESP_MAX_BYTES     (512 * 1024)
-#define TTS_PLAYBACK_CHUNK     4096
-#define TTS_HTTP_TIMEOUT_MS    15000
+#define TTS_DEFAULT_URL         "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+#define TTS_DEFAULT_RESOURCE_ID "seed-tts-2.0"
+#define TTS_DEFAULT_SPEAKER     "zh_female_vv_uranus_bigtts"
+#define TTS_HTTP_TIMEOUT_MS     20000
+#define TTS_WRITE_TIMEOUT_MS    2000
+/* One JSON slice stays small; this only bounds a malformed reply. */
+#define TTS_SLICE_MAX_BYTES (128 * 1024)
+
+#define TTS_ERROR_SNIPPET_LEN 200
 
 typedef struct {
-    char *data;
+    char *buf;        /* Holds the not-yet-complete trailing JSON object. */
     size_t len;
     size_t capacity;
     bool overflow;
-} tts_response_buffer_t;
+    esp_err_t play_err;
+    size_t total_pcm;
+    /* First bytes of the raw body, kept NUL-terminated for error reporting.
+     * buf cannot be used for this: complete objects are consumed out of it. */
+    char error_snippet[TTS_ERROR_SNIPPET_LEN + 1];
+    size_t error_snippet_len;
+} tts_stream_t;
 
-/** Allocate from PSRAM when available, falling back to internal RAM. */
-static void *tts_alloc(size_t size)
-{
-    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+/* ------------------------------------------------------------------ */
+/* Playback                                                            */
+/* ------------------------------------------------------------------ */
 
-    return ptr ? ptr : malloc(size);
-}
-
-static esp_err_t tts_response_append(tts_response_buffer_t *buf, const char *data, size_t len)
-{
-    if (buf->len + len + 1 > TTS_RESP_MAX_BYTES) {
-        if (!buf->overflow) {
-            ESP_LOGE(TAG, "TTS response exceeds %d bytes, aborting", TTS_RESP_MAX_BYTES);
-            buf->overflow = true;
-        }
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (buf->len + len + 1 > buf->capacity) {
-        size_t new_cap = buf->capacity ? buf->capacity * 2 : TTS_RESP_INITIAL_CAP;
-
-        while (new_cap < buf->len + len + 1) {
-            new_cap *= 2;
-        }
-        if (new_cap > TTS_RESP_MAX_BYTES) {
-            new_cap = TTS_RESP_MAX_BYTES;
-        }
-
-        char *new_ptr = tts_alloc(new_cap);
-        if (!new_ptr) {
-            ESP_LOGE(TAG, "Failed to grow TTS response buffer to %u bytes", (unsigned)new_cap);
-            return ESP_ERR_NO_MEM;
-        }
-        if (buf->len > 0) {
-            memcpy(new_ptr, buf->data, buf->len);
-        }
-        free(buf->data);
-        buf->data = new_ptr;
-        buf->capacity = new_cap;
-    }
-
-    memcpy(buf->data + buf->len, data, len);
-    buf->len += len;
-    buf->data[buf->len] = '\0';
-    return ESP_OK;
-}
-
-static esp_err_t tts_http_event_handler(esp_http_client_event_t *evt)
-{
-    tts_response_buffer_t *buf = (tts_response_buffer_t *)evt->user_data;
-
-    if (evt->event_id == HTTP_EVENT_ON_DATA && buf && evt->data_len > 0) {
-        return tts_response_append(buf, (const char *)evt->data, (size_t)evt->data_len);
-    }
-    return ESP_OK;
-}
-
-/** Stream decoded PCM to the speaker in bounded chunks. */
 static esp_err_t tts_play_pcm(const uint8_t *pcm, size_t pcm_len)
 {
     size_t offset = 0;
 
     while (offset < pcm_len) {
-        size_t chunk = pcm_len - offset;
         size_t written = 0;
-        esp_err_t err;
+        esp_err_t err = voice_audio_io_write(pcm + offset, pcm_len - offset, &written,
+                                             TTS_WRITE_TIMEOUT_MS);
 
-        if (chunk > TTS_PLAYBACK_CHUNK) {
-            chunk = TTS_PLAYBACK_CHUNK;
-        }
-
-        err = i2s_audio_driver_write(pcm + offset, chunk, &written, 1000);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "I2S write failed after %u bytes: %s", (unsigned)offset,
+            ESP_LOGE(TAG, "Speaker write failed after %u bytes: %s", (unsigned)offset,
                      esp_err_to_name(err));
             return err;
         }
         if (written == 0) {
-            ESP_LOGE(TAG, "I2S write stalled after %u bytes", (unsigned)offset);
+            ESP_LOGE(TAG, "Speaker stalled after %u bytes", (unsigned)offset);
             return ESP_ERR_TIMEOUT;
         }
         offset += written;
     }
-
     return ESP_OK;
 }
 
-/**
- * Decode the base64 `data` field of a Volcengine TTS response and play it.
- *
- * The non-streaming ("query") endpoint answers with a JSON envelope
- * {"code":3000,"message":"Success","data":"<base64 pcm>"}, so the body must be
- * parsed and decoded before it can be handed to the speaker.
- */
-static esp_err_t tts_decode_and_play(const char *body, size_t body_len)
+/** Decode one `{"code":..,"data":"..."}` object and play its audio slice. */
+static esp_err_t tts_consume_object(tts_stream_t *stream, const char *json, size_t json_len)
 {
-    cJSON *root;
-    cJSON *data_item;
-    cJSON *code_item;
+    cJSON *root = cJSON_ParseWithLength(json, json_len);
+    cJSON *code;
+    cJSON *data;
     const char *b64;
     size_t b64_len;
     size_t pcm_capacity;
@@ -148,44 +97,37 @@ static esp_err_t tts_decode_and_play(const char *body, size_t body_len)
     int mbed_ret;
     esp_err_t err;
 
-    if (!body || body_len == 0) {
-        ESP_LOGE(TAG, "Empty TTS response body");
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    root = cJSON_ParseWithLength(body, body_len);
     if (!root) {
-        ESP_LOGE(TAG, "Failed to parse TTS response JSON");
+        /* The caller only passes brace-balanced slices, so a parse failure
+         * means a corrupt object rather than a truncated one. Report it
+         * instead of silently leaving a hole in the audio. */
+        ESP_LOGE(TAG, "Malformed TTS slice (%u bytes) dropped", (unsigned)json_len);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    code_item = cJSON_GetObjectItem(root, "code");
-    if (cJSON_IsNumber(code_item) && code_item->valueint != TTS_SUCCESS_CODE) {
-        cJSON *message_item = cJSON_GetObjectItem(root, "message");
+    code = cJSON_GetObjectItem(root, "code");
+    if (cJSON_IsNumber(code) && code->valueint != 0) {
+        cJSON *message = cJSON_GetObjectItem(root, "message");
 
-        ESP_LOGE(TAG, "TTS service returned code=%d message=%s", code_item->valueint,
-                 (cJSON_IsString(message_item) && message_item->valuestring)
-                     ? message_item->valuestring
-                     : "(none)");
+        ESP_LOGE(TAG, "TTS service returned code=%d message=%s", code->valueint,
+                 (cJSON_IsString(message) && message->valuestring) ? message->valuestring : "(none)");
         cJSON_Delete(root);
         return ESP_FAIL;
     }
 
-    data_item = cJSON_GetObjectItem(root, "data");
-    if (!cJSON_IsString(data_item) || !data_item->valuestring || !data_item->valuestring[0]) {
-        ESP_LOGE(TAG, "TTS response has no base64 'data' field");
+    data = cJSON_GetObjectItem(root, "data");
+    if (!cJSON_IsString(data) || !data->valuestring || !data->valuestring[0]) {
+        /* Trailing slices carry only timestamps/usage and no audio. */
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
+        return ESP_OK;
     }
 
-    b64 = data_item->valuestring;
+    b64 = data->valuestring;
     b64_len = strlen(b64);
-
-    /* base64 expands 3 bytes into 4, so the decoded payload is at most 3/4 of it. */
+    /* base64 packs 3 bytes into 4 characters. */
     pcm_capacity = (b64_len / 4 + 1) * 3;
-    pcm = tts_alloc(pcm_capacity);
+    pcm = malloc(pcm_capacity);
     if (!pcm) {
-        ESP_LOGE(TAG, "Failed to allocate %u bytes for decoded PCM", (unsigned)pcm_capacity);
         cJSON_Delete(root);
         return ESP_ERR_NO_MEM;
     }
@@ -195,79 +137,209 @@ static esp_err_t tts_decode_and_play(const char *body, size_t body_len)
     cJSON_Delete(root);
 
     if (mbed_ret != 0) {
-        ESP_LOGE(TAG, "base64 decode of TTS audio failed: -0x%04x", -mbed_ret);
+        ESP_LOGE(TAG, "base64 decode failed: -0x%04x", -mbed_ret);
         free(pcm);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ESP_LOGI(TAG, "Playing %u bytes of decoded PCM (~%u ms @%d Hz)", (unsigned)pcm_len,
-             (unsigned)(pcm_len * 1000 / (TTS_SAMPLE_RATE * 2)), TTS_SAMPLE_RATE);
-
     err = tts_play_pcm(pcm, pcm_len);
+    stream->total_pcm += pcm_len;
     free(pcm);
     return err;
 }
 
-static char *tts_build_request_body(const app_config_t *config, const char *text,
-                                    const char *voice_type)
+/* ------------------------------------------------------------------ */
+/* Chunked JSON splitting                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Find the end of the first complete top-level JSON object in @p buf.
+ *
+ * Chunk boundaries do not line up with object boundaries, so the stream is
+ * scanned for balanced braces while ignoring braces inside strings.
+ *
+ * @return length of the object including its closing brace, or 0 if the buffer
+ *         does not yet hold a complete one.
+ */
+static size_t tts_find_object_end(const char *buf, size_t len, size_t *out_start)
 {
+    size_t start = 0;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    while (start < len && buf[start] != '{') {
+        start++;
+    }
+    if (start >= len) {
+        return 0;
+    }
+    *out_start = start;
+
+    for (size_t i = start; i < len; i++) {
+        char c = buf[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\' && in_string) {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                return i - start + 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static esp_err_t tts_stream_append(tts_stream_t *stream, const char *data, size_t len)
+{
+    size_t start = 0;
+    size_t object_len;
+
+    if (stream->error_snippet_len < TTS_ERROR_SNIPPET_LEN) {
+        size_t room = TTS_ERROR_SNIPPET_LEN - stream->error_snippet_len;
+        size_t copy = len < room ? len : room;
+
+        memcpy(stream->error_snippet + stream->error_snippet_len, data, copy);
+        stream->error_snippet_len += copy;
+        stream->error_snippet[stream->error_snippet_len] = '\0';
+    }
+
+    if (stream->len + len > TTS_SLICE_MAX_BYTES) {
+        if (!stream->overflow) {
+            ESP_LOGE(TAG, "TTS slice exceeds %d bytes; aborting", TTS_SLICE_MAX_BYTES);
+            stream->overflow = true;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (stream->len + len > stream->capacity) {
+        size_t new_cap = stream->capacity ? stream->capacity * 2 : 8192;
+
+        while (new_cap < stream->len + len) {
+            new_cap *= 2;
+        }
+        char *grown = realloc(stream->buf, new_cap);
+        if (!grown) {
+            return ESP_ERR_NO_MEM;
+        }
+        stream->buf = grown;
+        stream->capacity = new_cap;
+    }
+
+    memcpy(stream->buf + stream->len, data, len);
+    stream->len += len;
+
+    /* Drain every complete object currently buffered. */
+    while ((object_len = tts_find_object_end(stream->buf, stream->len, &start)) > 0) {
+        esp_err_t err = tts_consume_object(stream, stream->buf + start, object_len);
+
+        if (err != ESP_OK) {
+            stream->play_err = err;
+            return err;
+        }
+
+        size_t consumed = start + object_len;
+        memmove(stream->buf, stream->buf + consumed, stream->len - consumed);
+        stream->len -= consumed;
+        start = 0;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t tts_http_event_handler(esp_http_client_event_t *evt)
+{
+    tts_stream_t *stream = (tts_stream_t *)evt->user_data;
+
+    if (evt->event_id == HTTP_EVENT_ON_DATA && stream && evt->data_len > 0) {
+        return tts_stream_append(stream, (const char *)evt->data, (size_t)evt->data_len);
+    }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Request construction                                                */
+/* ------------------------------------------------------------------ */
+
+static char *tts_build_request_body(const app_config_t *config, const char *text)
+{
+    const char *speaker = config->tts_speaker[0] ? config->tts_speaker : TTS_DEFAULT_SPEAKER;
     cJSON *root = cJSON_CreateObject();
-    cJSON *app;
-    cJSON *user;
-    cJSON *audio;
-    cJSON *request;
-    char *json_body;
+    cJSON *req_params;
+    cJSON *audio_params;
+    char *json;
 
     if (!root) {
         return NULL;
     }
 
-    app = cJSON_AddObjectToObject(root, "app");
-    if (config->tts_app_id[0]) {
-        cJSON_AddStringToObject(app, "appid", config->tts_app_id);
-    }
-    cJSON_AddStringToObject(app, "token", config->tts_api_key[0] ? config->tts_api_key : "default");
-    cJSON_AddStringToObject(app, "cluster", TTS_DEFAULT_CLUSTER);
+    req_params = cJSON_AddObjectToObject(root, "req_params");
+    cJSON_AddStringToObject(req_params, "text", text);
+    cJSON_AddStringToObject(req_params, "speaker", speaker);
 
-    user = cJSON_AddObjectToObject(root, "user");
-    cJSON_AddStringToObject(user, "uid", "esp_claw_device");
+    audio_params = cJSON_AddObjectToObject(req_params, "audio_params");
+    /* PCM is what the speaker takes directly, so no decoder is needed, and the
+     * rate matches the board's I2S TX channel so no resampling is needed. */
+    cJSON_AddStringToObject(audio_params, "format", "pcm");
+    cJSON_AddNumberToObject(audio_params, "sample_rate", voice_audio_io_get_speaker_sample_rate());
 
-    audio = cJSON_AddObjectToObject(root, "audio");
-    cJSON_AddStringToObject(audio, "voice_type", voice_type);
-    cJSON_AddStringToObject(audio, "encoding", "pcm");
-    cJSON_AddNumberToObject(audio, "sample_rate", TTS_SAMPLE_RATE);
-
-    request = cJSON_AddObjectToObject(root, "request");
-    cJSON_AddStringToObject(request, "reqid", "esp-claw-tts");
-    cJSON_AddStringToObject(request, "text", text);
-    cJSON_AddStringToObject(request, "operation", "query");
-
-    json_body = cJSON_PrintUnformatted(root);
+    json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    return json_body;
+    return json;
+}
+
+static void tts_build_uuid(char *buf, size_t buf_size)
+{
+    snprintf(buf, buf_size, "%08" PRIx32 "-%04" PRIx32 "-4%03" PRIx32 "-%04" PRIx32 "-%08" PRIx32
+                            "%04" PRIx32,
+             esp_random(), esp_random() & 0xFFFF, esp_random() & 0xFFF,
+             (esp_random() & 0x3FFF) | 0x8000, esp_random(), esp_random() & 0xFFFF);
 }
 
 esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
 {
     const char *url;
-    const char *voice_type;
-    char *json_body;
-    char *auth_hdr = NULL;
-    esp_http_client_handle_t client;
-    tts_response_buffer_t resp_buf = {0};
+    const char *resource_id;
+    char request_id[40];
+    char *json_body = NULL;
+    char *api_key_header = NULL;
+    esp_http_client_handle_t client = NULL;
+    tts_stream_t stream = {0};
     esp_err_t err;
 
     if (!config || !text || text[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!config->voice_api_key[0]) {
+        ESP_LOGE(TAG, "Voice API key is not configured");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     url = config->tts_base_url[0] ? config->tts_base_url : TTS_DEFAULT_URL;
-    voice_type = config->tts_voice_type[0] ? config->tts_voice_type : TTS_DEFAULT_VOICE_TYPE;
+    resource_id = config->tts_resource_id[0] ? config->tts_resource_id : TTS_DEFAULT_RESOURCE_ID;
+    tts_build_uuid(request_id, sizeof(request_id));
 
-    ESP_LOGI(TAG, "Requesting Volcengine TTS: voice='%s' url='%s' text='%.60s%s'", voice_type, url,
-             text, strlen(text) > 60 ? "..." : "");
+    ESP_LOGI(TAG, "TTS request: resource=%s text='%.60s%s'", resource_id, text,
+             strlen(text) > 60 ? "..." : "");
 
-    json_body = tts_build_request_body(config, text, voice_type);
+    json_body = tts_build_request_body(config, text);
     if (!json_body) {
         return ESP_ERR_NO_MEM;
     }
@@ -275,8 +347,9 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
     esp_http_client_config_t http_cfg = {
         .url = url,
         .event_handler = tts_http_event_handler,
-        .user_data = &resp_buf,
+        .user_data = &stream,
         .timeout_ms = TTS_HTTP_TIMEOUT_MS,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     client = esp_http_client_init(&http_cfg);
@@ -287,45 +360,37 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-
-    if (config->tts_api_key[0]) {
-        /* Kept off the task stack: the token alone can be APP_CONFIG_STR_LEN bytes. */
-        size_t auth_len = strlen(config->tts_api_key) + sizeof("Bearer;");
-
-        auth_hdr = malloc(auth_len);
-        if (!auth_hdr) {
-            esp_http_client_cleanup(client);
-            free(json_body);
-            return ESP_ERR_NO_MEM;
-        }
-        /* Volcengine expects the "Bearer;" (semicolon) prefix, not "Bearer ". */
-        snprintf(auth_hdr, auth_len, "Bearer;%s", config->tts_api_key);
-        esp_http_client_set_header(client, "Authorization", auth_hdr);
-    }
-
+    /* New-console auth: a single X-Api-Key, no Bearer token. */
+    esp_http_client_set_header(client, "X-Api-Key", config->voice_api_key);
+    esp_http_client_set_header(client, "X-Api-Resource-Id", resource_id);
+    esp_http_client_set_header(client, "X-Api-Request-Id", request_id);
     esp_http_client_set_post_field(client, json_body, strlen(json_body));
 
     err = esp_http_client_perform(client);
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
 
-        ESP_LOGI(TAG, "TTS HTTP status=%d, response len=%u", status, (unsigned)resp_buf.len);
-        if (resp_buf.overflow) {
-            err = ESP_ERR_NO_MEM;
-        } else if (status != 200) {
-            ESP_LOGE(TAG, "TTS HTTP request rejected with status %d: %.200s", status,
-                     resp_buf.data ? resp_buf.data : "(empty)");
+        if (status != 200) {
+            ESP_LOGE(TAG, "TTS HTTP status %d: %s", status,
+                     stream.error_snippet_len ? stream.error_snippet : "(empty body)");
             err = ESP_FAIL;
+        } else if (stream.play_err != ESP_OK) {
+            err = stream.play_err;
+        } else if (stream.total_pcm == 0) {
+            ESP_LOGE(TAG, "TTS returned no audio");
+            err = ESP_ERR_INVALID_RESPONSE;
         } else {
-            err = tts_decode_and_play(resp_buf.data, resp_buf.len);
+            ESP_LOGI(TAG, "Played %u bytes of PCM (~%u ms)", (unsigned)stream.total_pcm,
+                     (unsigned)(stream.total_pcm * 1000 /
+                                (size_t)(voice_audio_io_get_speaker_sample_rate() * 2)));
         }
     } else {
         ESP_LOGE(TAG, "TTS HTTP perform failed: %s", esp_err_to_name(err));
     }
 
     esp_http_client_cleanup(client);
-    free(resp_buf.data);
-    free(auth_hdr);
+    free(stream.buf);
+    free(api_key_header);
     free(json_body);
     return err;
 }

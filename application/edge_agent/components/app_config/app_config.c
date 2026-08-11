@@ -61,16 +61,16 @@ typedef struct {
 #define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS   ""
 #define APP_DEFAULT_ENABLED_LUA_MODULES      ""
 #define APP_DEFAULT_TIME_TIMEZONE            "CST-8"
-#define APP_DEFAULT_ASR_PROVIDER             "volcengine_sensevoice"
-#define APP_DEFAULT_ASR_API_KEY              ""
-#define APP_DEFAULT_ASR_APP_ID               ""
-#define APP_DEFAULT_ASR_RESOURCE_ID          "volc.sensevoice.v1"
-#define APP_DEFAULT_ASR_BASE_URL             "https://openspeech.bytedance.com/api/v1/asr"
-#define APP_DEFAULT_TTS_PROVIDER             "volcengine_tts"
-#define APP_DEFAULT_TTS_API_KEY              ""
-#define APP_DEFAULT_TTS_APP_ID               ""
-#define APP_DEFAULT_TTS_VOICE_TYPE           "BV001_streaming"
-#define APP_DEFAULT_TTS_BASE_URL             "https://openspeech.bytedance.com/api/v1/tts"
+/* Volcengine voice services, new-console auth (a single X-Api-Key).
+ * ASR: 大模型流式语音识别, 流式输入模式 (WebSocket, higher accuracy than the
+ * bidirectional mode and enough since the agent consumes finished sentences).
+ * TTS: 单向流式语音合成 over HTTP chunked, PCM slices played as they arrive. */
+#define APP_DEFAULT_VOICE_API_KEY            ""
+#define APP_DEFAULT_ASR_RESOURCE_ID          "volc.seedasr.sauc.duration"
+#define APP_DEFAULT_ASR_BASE_URL             "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
+#define APP_DEFAULT_TTS_RESOURCE_ID          "seed-tts-2.0"
+#define APP_DEFAULT_TTS_SPEAKER              "zh_female_vv_uranus_bigtts"
+#define APP_DEFAULT_TTS_BASE_URL             "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 
 static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(wifi_ssid, "wifi_ssid", APP_WIFI_SSID),
@@ -107,16 +107,19 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS),
     APP_CONFIG_FIELD(enabled_lua_modules, "en_lua_mods", APP_DEFAULT_ENABLED_LUA_MODULES),
     APP_CONFIG_FIELD(time_timezone, "time_timezone", APP_DEFAULT_TIME_TIMEZONE),
-    APP_CONFIG_FIELD(asr_provider, "asr_provider", APP_DEFAULT_ASR_PROVIDER),
-    APP_CONFIG_FIELD(asr_api_key, "asr_api_key", APP_DEFAULT_ASR_API_KEY),
-    APP_CONFIG_FIELD(asr_app_id, "asr_app_id", APP_DEFAULT_ASR_APP_ID),
-    APP_CONFIG_FIELD(asr_resource_id, "asr_res_id", APP_DEFAULT_ASR_RESOURCE_ID),
-    APP_CONFIG_FIELD(asr_base_url, "asr_base_url", APP_DEFAULT_ASR_BASE_URL),
-    APP_CONFIG_FIELD(tts_provider, "tts_provider", APP_DEFAULT_TTS_PROVIDER),
-    APP_CONFIG_FIELD(tts_api_key, "tts_api_key", APP_DEFAULT_TTS_API_KEY),
-    APP_CONFIG_FIELD(tts_app_id, "tts_app_id", APP_DEFAULT_TTS_APP_ID),
-    APP_CONFIG_FIELD(tts_voice_type, "tts_voice_type", APP_DEFAULT_TTS_VOICE_TYPE),
-    APP_CONFIG_FIELD(tts_base_url, "tts_base_url", APP_DEFAULT_TTS_BASE_URL),
+    /* NVS keys are capped at 15 characters.
+     * These carry a v3 suffix on purpose: a device provisioned by the previous
+     * firmware still has the v1 REST URLs stored under asr_base_url /
+     * tts_base_url / asr_res_id, and a stored value wins over the default. The
+     * v1 "https://.../api/v1/asr" would then be handed to the WebSocket client,
+     * which rejects the scheme outright. New keys let those stale values be
+     * ignored instead of silently breaking the pipeline. */
+    APP_CONFIG_FIELD(voice_api_key, "voice_api_key", APP_DEFAULT_VOICE_API_KEY),
+    APP_CONFIG_FIELD(asr_resource_id, "asr_v3_res", APP_DEFAULT_ASR_RESOURCE_ID),
+    APP_CONFIG_FIELD(asr_base_url, "asr_v3_url", APP_DEFAULT_ASR_BASE_URL),
+    APP_CONFIG_FIELD(tts_resource_id, "tts_v3_res", APP_DEFAULT_TTS_RESOURCE_ID),
+    APP_CONFIG_FIELD(tts_speaker, "tts_speaker", APP_DEFAULT_TTS_SPEAKER),
+    APP_CONFIG_FIELD(tts_base_url, "tts_v3_url", APP_DEFAULT_TTS_BASE_URL),
 };
 
 // for backward compatibility, migrate from old settings to new settings

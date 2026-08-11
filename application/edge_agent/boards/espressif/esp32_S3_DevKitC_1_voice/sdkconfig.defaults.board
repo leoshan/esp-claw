@@ -1,0 +1,21 @@
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# This DevKitC-1 carries 16MB of SPI flash. Building for 8MB left half the
+# chip unused and made the bootloader log
+# "Detected size(16384k) larger than the size in the binary image header".
+#
+# tools/cmake/flash_partition_defaults.cmake reads this flash size and
+# auto-selects partitions_16MB.csv, so do not set PARTITION_TABLE_* here.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# I2S peripherals declared in board_peripherals.yaml (mic + speaker)
+CONFIG_ESP_BOARD_PERIPH_I2S_SUPPORT=y
+
+# Voice pipeline: ASR/TTS over the board-managed I2S mic and speaker
+CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED=y

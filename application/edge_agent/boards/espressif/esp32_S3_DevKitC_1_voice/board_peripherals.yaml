@@ -51,7 +51,11 @@ peripherals:
       data_bit_width: 16
       slot_bit_width: I2S_SLOT_BIT_WIDTH_AUTO
       slot_mode: I2S_SLOT_MODE_MONO
-      slot_mask: I2S_STD_SLOT_BOTH
+      # LEFT, not BOTH: the INMP441 has L/R tied low so it drives the left
+      # slot only. With BOTH in mono mode the driver captures both slots, which
+      # doubles the byte rate and hands the recognizer an interleaved stream it
+      # cannot decode. Matches xiaozhi-esp32's no_audio_codec.cc for this wiring.
+      slot_mask: I2S_STD_SLOT_LEFT
       ws_width: 16
       pins:
         mclk: -1

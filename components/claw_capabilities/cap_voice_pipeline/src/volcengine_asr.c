@@ -261,9 +261,12 @@ static void asr_handle_server_frame(asr_session_t *session, const uint8_t *data,
     }
 
     if (msg_type != ASR_MSG_FULL_SERVER || payload_len == 0) {
+        ESP_LOGW(TAG, "Ignoring server frame type=0x%02x payload=%" PRIu32, msg_type, payload_len);
         return;
     }
 
+    ESP_LOGI(TAG, "Server response (%" PRIu32 " bytes): %.*s", payload_len, (int)payload_len,
+             (const char *)data + offset);
     asr_parse_payload(session, (const char *)data + offset, payload_len);
 
     /* In 流式输入模式 the transcript that follows our final packet is the
@@ -321,6 +324,12 @@ static void asr_websocket_event_handler(void *handler_args, esp_event_base_t bas
         if (data->op_code == 0x02 && data->data_len > 0) {
             asr_accumulate(session, data->data_ptr, data->data_len, data->payload_len,
                            data->payload_offset);
+        } else if (data->op_code != 0x0A && data->data_len > 0) {
+            /* Anything else arriving with a payload means the service is
+             * answering in a form this client does not expect; surface it
+             * rather than dropping it silently. */
+            ESP_LOGW(TAG, "Non-binary frame op_code=0x%02x len=%d: %.*s", data->op_code,
+                     data->data_len, data->data_len, data->data_ptr);
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
@@ -437,7 +446,12 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
     char request_id[40];
     char *headers = NULL;
     char *config_payload = NULL;
-    uint8_t *pcm_chunk = NULL;
+    /* Double buffer: one chunk is captured while the previous one waits to
+     * learn whether it is the final (negative-sequence) packet. */
+    uint8_t *pcm_chunk[2] = {NULL, NULL};
+    int capture_idx = 0;
+    int pending_idx = 0;
+    size_t pending_len = 0;
     esp_websocket_client_handle_t client = NULL;
     asr_session_t session = {0};
     EventBits_t bits;
@@ -460,11 +474,12 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
     asr_build_uuid(request_id, sizeof(request_id));
 
     session.events = xEventGroupCreate();
-    pcm_chunk = malloc(ASR_PACKET_BYTES);
+    pcm_chunk[0] = malloc(ASR_PACKET_BYTES);
+    pcm_chunk[1] = malloc(ASR_PACKET_BYTES);
     headers = asr_build_headers(config, request_id);
     config_payload = asr_build_config_payload();
 
-    if (!session.events || !pcm_chunk || !headers || !config_payload) {
+    if (!session.events || !pcm_chunk[0] || !pcm_chunk[1] || !headers || !config_payload) {
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -511,10 +526,15 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         goto cleanup;
     }
 
-    /* 2. Stream captured PCM as it arrives. */
+    /* 2. Stream captured PCM as it arrives.
+     *
+     * One packet is always held back: the protocol marks the end of the
+     * utterance by giving the LAST audio packet a negative sequence, so the
+     * most recent chunk can only be sent once we know another one follows. */
     while (elapsed_ms < ASR_MAX_CAPTURE_MS) {
         size_t bytes_read = 0;
         esp_err_t read_err;
+        uint8_t *capture = pcm_chunk[capture_idx];
 
         if (xEventGroupGetBits(session.events) & ASR_EVT_FAILED) {
             ESP_LOGE(TAG, "ASR session failed while streaming");
@@ -522,7 +542,7 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
             goto cleanup;
         }
 
-        read_err = voice_audio_io_read(pcm_chunk, ASR_PACKET_BYTES, &bytes_read,
+        read_err = voice_audio_io_read(capture, ASR_PACKET_BYTES, &bytes_read,
                                        ASR_READ_TIMEOUT_MS);
         if (read_err != ESP_OK || bytes_read == 0) {
             /* Charge the wait against the budget even when nothing was read,
@@ -541,14 +561,19 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         }
         empty_reads = 0;
 
-        /* Send what was just captured before deciding to stop, so the tail of
-         * the utterance is never dropped. */
-        sequence++;
-        err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, sequence, true, pcm_chunk,
-                             bytes_read);
-        if (err != ESP_OK) {
-            goto cleanup;
+        /* Flush the previous chunk now that we know it is not the last one. */
+        if (pending_len > 0) {
+            sequence++;
+            err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, sequence, true,
+                                 pcm_chunk[pending_idx], pending_len);
+            if (err != ESP_OK) {
+                goto cleanup;
+            }
         }
+
+        pending_idx = capture_idx;
+        pending_len = bytes_read;
+        capture_idx ^= 1;
 
         /* Derive elapsed time from the samples actually captured; a partial
          * read must not be charged as a full packet. */
@@ -559,10 +584,12 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         }
     }
 
-    /* 3. A negative sequence marks the last packet and asks for the result. */
+    /* 3. The held-back chunk goes out with a negative sequence, which is what
+     * tells the service the utterance is complete and a result is due. */
     sequence++;
     session.final_sent = true;
-    err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, -sequence, true, pcm_chunk, 0);
+    err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, -sequence, true,
+                         pcm_chunk[pending_idx], pending_len);
     if (err != ESP_OK) {
         goto cleanup;
     }
@@ -599,7 +626,8 @@ cleanup:
     }
     free(session.text);
     free(session.rx_buf);
-    free(pcm_chunk);
+    free(pcm_chunk[0]);
+    free(pcm_chunk[1]);
     free(headers);
     free(config_payload);
     return err;

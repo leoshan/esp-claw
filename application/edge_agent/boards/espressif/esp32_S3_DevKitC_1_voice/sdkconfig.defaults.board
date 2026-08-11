@@ -17,6 +17,13 @@ CONFIG_SPIRAM_SPEED_80M=y
 # I2S peripherals declared in board_peripherals.yaml (mic + speaker)
 CONFIG_ESP_BOARD_PERIPH_I2S_SUPPORT=y
 
+# The MAX98357A is a bare I2S amplifier with no control interface, so the
+# board manager builds its audio_dac device on the "dummy" codec. Without this
+# the codec registry has no such entry and boot logs
+#   E DEV_AUDIO_CODEC: Unsupported codec: dummy
+#   E BOARD_DEVICE: Failed to init device: audio_dac
+CONFIG_CODEC_DUMMY_SUPPORT=y
+
 # Voice pipeline: ASR/TTS over the board-managed I2S mic and speaker
 CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED=y
 

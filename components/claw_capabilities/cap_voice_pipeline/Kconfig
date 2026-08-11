@@ -2,16 +2,21 @@ menu "Voice Pipeline Capability Configuration"
 
 config CLAW_CAP_VOICE_PIPELINE_ENABLED
     bool "Enable Voice Pipeline Capability"
-    default y
+    default n
     help
         Enables the I2S hardware audio pipeline with Volcengine SenseVoice ASR
         and TTS.
 
         This capability drives I2S directly on the pins configured below and
         does not go through the board manager / esp_codec_dev abstraction, so
-        it must only be enabled on boards whose pins are known to be free.
-        Leave it disabled on boards that already assign those pins to a codec,
-        display or other peripheral.
+        it must only be enabled on boards whose pins are known to be free, and
+        the pins below must be set to match the actual wiring.
+
+        Known conflict: on esp32_S3_DevKitC_1_breadboard the board profile
+        already claims GPIO 4/5 (LCD SPI clock and MOSI), 6 (LCD reset),
+        7 (LCD D/C), 15 (LCD CS), 16 (LCD backlight PWM) and 9 (PDM audio out
+        on I2S controller 0). Enabling this capability with the defaults on
+        that board takes the display's pins away from it.
 
 if CLAW_CAP_VOICE_PIPELINE_ENABLED
 

@@ -14,6 +14,7 @@
 #include "driver/i2s_std.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_private/esp_gpio_reserve.h"
 #include "freertos/FreeRTOS.h"
 
 #include "voice_pipeline_private.h"
@@ -41,6 +42,53 @@ esp_err_t i2s_audio_driver_deinit(void)
     return ESP_OK;
 }
 
+/**
+ * Refuse to start when any configured pin is already reserved by another
+ * driver.
+ *
+ * The I2S driver itself only logs "GPIO %d is not usable, maybe conflict with
+ * others" and then takes the pin anyway (esp_driver_i2s/i2s_common.c), so
+ * without this check a mis-wired board silently loses its display, backlight
+ * or codec to the voice pipeline while init still reports success.
+ *
+ * Note this only catches peripherals that reserve their pins. Pins driven as
+ * plain GPIO (an LCD reset or D/C line, for example) are not reserved and
+ * cannot be detected here, so the board's own pin map remains the source of
+ * truth.
+ */
+static esp_err_t i2s_audio_check_pins_available(const cap_voice_hardware_config_t *hw)
+{
+    const struct {
+        const char *role;
+        int pin;
+    } pins[] = {
+        { "mic WS", hw->mic_ws_pin },     { "mic SCK", hw->mic_sck_pin },
+        { "mic DIN", hw->mic_din_pin },   { "speaker DOUT", hw->spk_dout_pin },
+        { "speaker BCLK", hw->spk_bclk_pin }, { "speaker LRCK", hw->spk_lrck_pin },
+    };
+    bool conflict = false;
+
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        if (pins[i].pin < 0) {
+            continue;
+        }
+        if (esp_gpio_is_reserved(BIT64(pins[i].pin))) {
+            ESP_LOGE(TAG, "GPIO %d (%s) is already reserved by another driver", pins[i].pin,
+                     pins[i].role);
+            conflict = true;
+        }
+    }
+
+    if (conflict) {
+        ESP_LOGE(TAG,
+                 "Refusing to initialize: remap the CLAW_CAP_VOICE_* GPIOs in menuconfig to pins "
+                 "this board leaves free, or disable CLAW_CAP_VOICE_PIPELINE_ENABLED");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t i2s_audio_driver_init(const cap_voice_hardware_config_t *hw)
 {
     esp_err_t ret;
@@ -51,6 +99,11 @@ esp_err_t i2s_audio_driver_init(const cap_voice_hardware_config_t *hw)
     if (rx_chan || tx_chan) {
         ESP_LOGW(TAG, "I2S audio driver already initialized");
         return ESP_ERR_INVALID_STATE;
+    }
+
+    ret = i2s_audio_check_pins_available(hw);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     ESP_LOGI(TAG,

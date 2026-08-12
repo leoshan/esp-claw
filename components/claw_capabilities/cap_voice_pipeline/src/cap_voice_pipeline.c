@@ -44,6 +44,7 @@ static const char *TAG = "cap_voice_pipeline";
 /* Bound on how long deinit waits for the capture and playback tasks. */
 #define VOICE_DEINIT_WAIT_MS      5000
 #define VOICE_CAP_GROUP_ID        "cap_voice_pipeline"
+#define VOICE_DISPLAY_CAP_GROUP_ID "cap_voice_display"
 #define VOICE_CHANNEL             "local"
 #define VOICE_CHAT_ID             "voice_user"
 #define VOICE_SENDER_ID           "voice_user"
@@ -64,6 +65,7 @@ typedef struct {
     QueueHandle_t tts_queue;
     TaskHandle_t tts_task;
     bool initialized;
+    bool display_ready;
     bool listening;
     bool speaking;
     TaskHandle_t record_task;
@@ -435,6 +437,47 @@ static esp_err_t cap_voice_execute_speak(const char *input_json, const claw_cap_
     return ESP_OK;
 }
 
+static esp_err_t cap_voice_execute_display_text(const char *input_json,
+                                               const claw_cap_call_context_t *ctx, char *output,
+                                               size_t output_size)
+{
+    cJSON *root;
+    cJSON *text_item;
+    esp_err_t err;
+
+    (void)ctx;
+
+    root = input_json ? cJSON_Parse(input_json) : NULL;
+    if (!root) {
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid JSON input\"}");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    text_item = cJSON_GetObjectItem(root, "text");
+    if (!cJSON_IsString(text_item) || !text_item->valuestring) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"missing 'text'\"}");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = voice_status_display_show_text(text_item->valuestring);
+    cJSON_Delete(root);
+
+    if (err == ESP_ERR_NOT_FOUND) {
+        snprintf(output, output_size,
+                 "{\"ok\":false,\"error\":\"no display detected on this board\"}");
+        return err;
+    }
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"%s\"}", esp_err_to_name(err));
+        return err;
+    }
+
+    snprintf(output, output_size,
+             "{\"ok\":true,\"message\":\"text shown until the next voice state change\"}");
+    return ESP_OK;
+}
+
 static const claw_cap_descriptor_t s_voice_descriptors[] = {
     {
         .id = "voice_listen",
@@ -474,6 +517,36 @@ static const claw_cap_group_t s_voice_group = {
     .group_id = VOICE_CAP_GROUP_ID,
     .descriptors = s_voice_descriptors,
     .descriptor_count = sizeof(s_voice_descriptors) / sizeof(s_voice_descriptors[0]),
+};
+
+/* Separate group so it is only advertised when a panel actually answered. An
+ * agent told it has a screen that then errors on every call is worse than one
+ * that knows there is none. */
+static const claw_cap_descriptor_t s_display_descriptors[] = {
+    {
+        .id = "display_text",
+        .name = "display_text",
+        .family = "display",
+        .description =
+            "Write a short message to the device's 128x32 monochrome OLED. It replaces whatever "
+            "is on screen and holds until the voice pipeline changes state (listening, thinking, "
+            "speaking). Only ASCII renders: about 10 characters per line over two lines, "
+            "lowercase is shown as uppercase, and Chinese or emoji come out blank, so write short "
+            "English or digits.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\","
+            "\"description\":\"ASCII text to show. Use \\n to break lines.\"}},"
+            "\"required\":[\"text\"]}",
+        .execute = cap_voice_execute_display_text,
+    },
+};
+
+static const claw_cap_group_t s_display_group = {
+    .group_id = VOICE_DISPLAY_CAP_GROUP_ID,
+    .descriptors = s_display_descriptors,
+    .descriptor_count = sizeof(s_display_descriptors) / sizeof(s_display_descriptors[0]),
 };
 
 /* ------------------------------------------------------------------ */
@@ -518,8 +591,9 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
      * app_main, so every later credential read would hit freed memory. */
     memcpy(&s_voice.config, config, sizeof(s_voice.config));
 
-    /* Optional: a board without the panel just runs without status faces. */
-    voice_status_display_init();
+    /* Optional: a board without the panel just runs without status output, and
+     * without advertising display_text to the agent. */
+    s_voice.display_ready = (voice_status_display_init() == ESP_OK);
 
     if (xTaskCreate(voice_tts_task, "v_tts", VOICE_TTS_TASK_STACK, NULL, VOICE_TTS_TASK_PRIO,
                     &s_voice.tts_task) != pdPASS) {
@@ -548,6 +622,15 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
                  esp_err_to_name(err));
         claw_cap_unregister_group(s_voice_group.group_id, 0);
         goto fail;
+    }
+
+    if (s_voice.display_ready && !claw_cap_group_exists(s_display_group.group_id)) {
+        err = claw_cap_register_group(&s_display_group);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register display capability group: %s", esp_err_to_name(err));
+            claw_cap_unregister_group(s_voice_group.group_id, 0);
+            goto fail;
+        }
     }
 
     /* Observe (never replace) outbound replies so web chat keeps working. */
@@ -581,6 +664,7 @@ esp_err_t cap_voice_pipeline_deinit(void)
     }
 
     cap_im_local_remove_outbound_observer(on_agent_outbound_message_cb);
+    claw_cap_unregister_group(s_display_group.group_id, 0);
     claw_cap_unregister_group(s_voice_group.group_id, 0);
 
     cap_voice_pipeline_stop_listening();

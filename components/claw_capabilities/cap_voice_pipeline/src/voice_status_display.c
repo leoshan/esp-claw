@@ -159,6 +159,9 @@ static void fb_rect(int x, int y, int w, int h)
 #define LABEL_GAP    3
 #define LABEL_CHAR_W (FONT_W * LABEL_SCALE)
 #define LABEL_ADVANCE (LABEL_CHAR_W + LABEL_GAP)
+/* Agent messages are longer than a status word, so they get a smaller cell:
+ * 2x gives 10 characters across and two rows. */
+#define MESSAGE_SCALE 2
 
 /* Classic 5x7 cell, one byte per column, bit 0 = top row. Only the glyphs the
  * status words need are stored. */
@@ -191,31 +194,110 @@ static const uint8_t FONT_AZ[26][FONT_W] = {
     {0x61, 0x51, 0x49, 0x45, 0x43}, /* Z */
 };
 
-static const uint8_t FONT_QUESTION[FONT_W] = {0x02, 0x01, 0x51, 0x09, 0x06};
+static const uint8_t FONT_09[10][FONT_W] = {
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, /* 0 */
+    {0x00, 0x42, 0x7F, 0x40, 0x00}, /* 1 */
+    {0x42, 0x61, 0x51, 0x49, 0x46}, /* 2 */
+    {0x21, 0x41, 0x45, 0x4B, 0x31}, /* 3 */
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, /* 4 */
+    {0x27, 0x45, 0x45, 0x45, 0x39}, /* 5 */
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, /* 6 */
+    {0x01, 0x71, 0x09, 0x05, 0x03}, /* 7 */
+    {0x36, 0x49, 0x49, 0x49, 0x36}, /* 8 */
+    {0x06, 0x49, 0x49, 0x29, 0x1E}, /* 9 */
+};
+
+/* Punctuation an agent-supplied string is likely to contain. */
+static const struct {
+    char c;
+    uint8_t cols[FONT_W];
+} FONT_PUNCT[] = {
+    {'?', {0x02, 0x01, 0x51, 0x09, 0x06}},
+    {'!', {0x00, 0x00, 0x5F, 0x00, 0x00}},
+    {'.', {0x00, 0x60, 0x60, 0x00, 0x00}},
+    {',', {0x00, 0x50, 0x30, 0x00, 0x00}},
+    {'-', {0x08, 0x08, 0x08, 0x08, 0x08}},
+    {':', {0x00, 0x36, 0x36, 0x00, 0x00}},
+    {'/', {0x20, 0x10, 0x08, 0x04, 0x02}},
+    {'+', {0x08, 0x08, 0x3E, 0x08, 0x08}},
+    {'%', {0x63, 0x13, 0x08, 0x64, 0x63}},
+    {'*', {0x14, 0x08, 0x3E, 0x08, 0x14}},
+    {'=', {0x14, 0x14, 0x14, 0x14, 0x14}},
+    {'(', {0x00, 0x1C, 0x22, 0x41, 0x00}},
+    {')', {0x00, 0x41, 0x22, 0x1C, 0x00}},
+};
+
 static const uint8_t FONT_BLANK[FONT_W] = {0x00, 0x00, 0x00, 0x00, 0x00};
 
+/**
+ * Look up a glyph. Lowercase folds to uppercase; anything else, including every
+ * multi-byte character, has no glyph in a 5x7 table and renders blank.
+ */
 static const uint8_t *font_glyph(char c)
 {
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
     if (c >= 'A' && c <= 'Z') {
         return FONT_AZ[c - 'A'];
     }
-    if (c == '?') {
-        return FONT_QUESTION;
+    if (c >= '0' && c <= '9') {
+        return FONT_09[c - '0'];
+    }
+    for (size_t i = 0; i < sizeof(FONT_PUNCT) / sizeof(FONT_PUNCT[0]); i++) {
+        if (FONT_PUNCT[i].c == c) {
+            return FONT_PUNCT[i].cols;
+        }
     }
     return FONT_BLANK;
 }
 
-/** Draw one glyph with every pixel expanded into a LABEL_SCALE square. */
-static void fb_char(int x, int y, char c)
+/** Draw one glyph with every pixel expanded into a scale x scale square. */
+static void fb_char(int x, int y, char c, int scale)
 {
     const uint8_t *glyph = font_glyph(c);
 
     for (int col = 0; col < FONT_W; col++) {
         for (int row = 0; row < FONT_H; row++) {
             if (glyph[col] & (1u << row)) {
-                fb_rect(x + col * LABEL_SCALE, y + row * LABEL_SCALE, LABEL_SCALE, LABEL_SCALE);
+                fb_rect(x + col * scale, y + row * scale, scale, scale);
             }
         }
+    }
+}
+
+/** Draw text at @p scale, wrapping onto as many rows as the panel allows. */
+static void fb_wrapped(const char *text, int scale)
+{
+    int char_w = FONT_W * scale;
+    int advance = char_w + scale;         /* one scaled pixel of tracking */
+    int line_h = FONT_H * scale + scale;
+    int per_line = OLED_WIDTH / advance;
+    int max_lines = OLED_HEIGHT / line_h;
+    int line = 0;
+    size_t i = 0;
+    size_t len = strlen(text);
+
+    if (per_line < 1 || max_lines < 1) {
+        return;
+    }
+
+    while (i < len && line < max_lines) {
+        int col = 0;
+
+        /* A newline or a full row ends the line; spaces at a break are eaten. */
+        while (i < len && col < per_line && text[i] != '\n') {
+            fb_char(col * advance, line * line_h, text[i], scale);
+            col++;
+            i++;
+        }
+        while (i < len && text[i] == ' ') {
+            i++;
+        }
+        if (i < len && text[i] == '\n') {
+            i++;
+        }
+        line++;
     }
 }
 
@@ -231,7 +313,7 @@ static void fb_label(const char *text)
         x = 0;
     }
     for (size_t i = 0; i < len; i++) {
-        fb_char(x + (int)i * LABEL_ADVANCE, y, text[i]);
+        fb_char(x + (int)i * LABEL_ADVANCE, y, text[i], LABEL_SCALE);
     }
 }
 
@@ -343,6 +425,35 @@ void voice_status_display_deinit(void)
         s_bus_referenced = false;
     }
     s_status_valid = false;
+}
+
+esp_err_t voice_status_display_show_text(const char *text)
+{
+    esp_err_t err;
+
+    if (!text) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_dev || !s_lock) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(OLED_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    fb_clear();
+    fb_wrapped(text, MESSAGE_SCALE);
+    err = oled_flush();
+
+    /* The message now owns the panel. Forget the cached status so the next
+     * state change always redraws, even if it repeats the previous state. */
+    s_status_valid = false;
+
+    xSemaphoreGive(s_lock);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Display update failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 void voice_status_display_set(voice_status_t status)

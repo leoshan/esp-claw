@@ -76,6 +76,11 @@ static const char *TAG = "volcengine_asr";
 /* Longest utterance we will capture before forcing the final packet. */
 #define ASR_MAX_CAPTURE_MS   (CONFIG_CLAW_CAP_VOICE_RECORD_DURATION_SEC * 1000)
 #define ASR_CONNECT_WAIT_MS  10000
+/* Audio captured while the handshake is still running. The I2S DMA only holds
+ * about 90 ms, so without somewhere to put these samples the first half second
+ * of speech is overwritten and lost. Two seconds covers a handshake several
+ * times slower than the ~550 ms measured on hardware. */
+#define ASR_PREBUFFER_BYTES (VOICE_ASR_SAMPLE_RATE * 2 * 2)
 #define ASR_RESULT_WAIT_MS   15000
 /* Frame payload buffer. The handshake headers use a separate buffer sized by
  * CONFIG_WS_BUFFER_SIZE, which must be large enough for this endpoint's
@@ -438,6 +443,37 @@ static esp_err_t asr_send_frame(esp_websocket_client_handle_t client, uint8_t ms
     return ESP_OK;
 }
 
+/**
+ * Send the previously staged chunk and stage @p data in its place.
+ *
+ * One chunk is always held back so the end of the utterance can be marked with
+ * a negative sequence, which is what asks the service for a result.
+ */
+static esp_err_t asr_stage_chunk(esp_websocket_client_handle_t client, uint8_t *const *pcm_chunk,
+                                 int *capture_idx, int *pending_idx, size_t *pending_len,
+                                 int32_t *sequence, const uint8_t *data, size_t len)
+{
+    if (*pending_len > 0) {
+        esp_err_t err;
+
+        (*sequence)++;
+        err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, *sequence, true,
+                             pcm_chunk[*pending_idx], *pending_len);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    /* Phase 2 reads straight into the staging slot; phase 1 copies in. */
+    if (data != pcm_chunk[*capture_idx]) {
+        memcpy(pcm_chunk[*capture_idx], data, len);
+    }
+    *pending_idx = *capture_idx;
+    *pending_len = len;
+    *capture_idx ^= 1;
+    return ESP_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public entry point                                                  */
 /* ------------------------------------------------------------------ */
@@ -463,6 +499,10 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
     int32_t sequence = 1;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    int waited_ms = 0;
+    uint8_t *prebuf = NULL;
+    size_t prebuf_len = 0;
+    bool released_early = false;
     /* Kept apart from elapsed_ms, which also counts read timeouts: a mic that
      * only ever times out would otherwise look like it captured speech. */
     size_t captured_bytes = 0;
@@ -483,10 +523,15 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
     session.events = xEventGroupCreate();
     pcm_chunk[0] = malloc(ASR_PACKET_BYTES);
     pcm_chunk[1] = malloc(ASR_PACKET_BYTES);
+    prebuf = heap_caps_malloc(ASR_PREBUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!prebuf) {
+        prebuf = malloc(ASR_PREBUFFER_BYTES);
+    }
     headers = asr_build_headers(config, request_id);
     config_payload = asr_build_config_payload();
 
-    if (!session.events || !pcm_chunk[0] || !pcm_chunk[1] || !headers || !config_payload) {
+    if (!session.events || !pcm_chunk[0] || !pcm_chunk[1] || !prebuf || !headers ||
+        !config_payload) {
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -518,27 +563,93 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         goto cleanup;
     }
 
-    bits = xEventGroupWaitBits(session.events, ASR_EVT_CONNECTED | ASR_EVT_FAILED, pdFALSE, pdFALSE,
-                               pdMS_TO_TICKS(ASR_CONNECT_WAIT_MS));
-    if (!(bits & ASR_EVT_CONNECTED)) {
-        ESP_LOGE(TAG, "ASR WebSocket did not connect");
-        err = ESP_ERR_TIMEOUT;
+    /* 1. Capture while the handshake runs, instead of after it.
+     *
+     * Waiting for the connection first left the microphone unread for the whole
+     * handshake, and the I2S DMA only retains about 90 ms, so roughly the first
+     * half second of speech was overwritten. Draining into a prebuffer means
+     * pressing and speaking immediately no longer clips the opening words. */
+    while (waited_ms < ASR_CONNECT_WAIT_MS) {
+        size_t bytes_read = 0;
+        size_t room = ASR_PREBUFFER_BYTES - prebuf_len;
+
+        bits = xEventGroupGetBits(session.events);
+        if (bits & ASR_EVT_FAILED) {
+            ESP_LOGE(TAG, "ASR WebSocket failed during handshake");
+            err = ESP_FAIL;
+            goto cleanup;
+        }
+        if (bits & ASR_EVT_CONNECTED) {
+            break;
+        }
+        if (room == 0) {
+            /* A handshake this slow is going to fail anyway; stop hoarding. */
+            break;
+        }
+
+        if (voice_audio_io_read(prebuf + prebuf_len, room < ASR_PACKET_BYTES ? room :
+                                                                              ASR_PACKET_BYTES,
+                                &bytes_read, ASR_READ_TIMEOUT_MS) == ESP_OK) {
+            prebuf_len += bytes_read;
+            captured_bytes += bytes_read;
+            elapsed_ms += (int)(bytes_read * 1000 / (VOICE_ASR_SAMPLE_RATE * 2));
+        }
+        waited_ms += ASR_READ_TIMEOUT_MS;
+
+        if (should_continue && !should_continue()) {
+            released_early = true;
+            break;
+        }
+    }
+
+    /* A tap released before the handshake finished never needed a connection. */
+    if (released_early && captured_bytes < ASR_MIN_CAPTURE_BYTES) {
+        ESP_LOGW(TAG, "Released after %u ms of audio; too short to be speech",
+                 (unsigned)(captured_bytes * 1000 / (VOICE_ASR_SAMPLE_RATE * 2)));
+        err = ESP_ERR_INVALID_SIZE;
         goto cleanup;
     }
 
-    /* 1. Announce the audio format before any samples go out. */
+    if (!(xEventGroupGetBits(session.events) & ASR_EVT_CONNECTED)) {
+        int remaining = ASR_CONNECT_WAIT_MS - waited_ms;
+
+        bits = xEventGroupWaitBits(session.events, ASR_EVT_CONNECTED | ASR_EVT_FAILED, pdFALSE,
+                                   pdFALSE, pdMS_TO_TICKS(remaining > 0 ? remaining : 1));
+        if (!(bits & ASR_EVT_CONNECTED)) {
+            ESP_LOGE(TAG, "ASR WebSocket did not connect");
+            err = ESP_ERR_TIMEOUT;
+            goto cleanup;
+        }
+    }
+
+    /* 2. Announce the audio format before any samples go out. */
     err = asr_send_frame(client, ASR_MSG_FULL_CLIENT, ASR_SERIAL_JSON, 1, true, config_payload,
                          strlen(config_payload));
     if (err != ESP_OK) {
         goto cleanup;
     }
 
-    /* 2. Stream captured PCM as it arrives.
-     *
-     * One packet is always held back: the protocol marks the end of the
-     * utterance by giving the LAST audio packet a negative sequence, so the
-     * most recent chunk can only be sent once we know another one follows. */
-    while (elapsed_ms < ASR_MAX_CAPTURE_MS) {
+    /* 3. Ship whatever was captured during the handshake. */
+    for (size_t off = 0; off < prebuf_len;) {
+        size_t chunk = prebuf_len - off;
+
+        if (chunk > ASR_PACKET_BYTES) {
+            chunk = ASR_PACKET_BYTES;
+        }
+        err = asr_stage_chunk(client, pcm_chunk, &capture_idx, &pending_idx, &pending_len, &sequence,
+                              prebuf + off, chunk);
+        if (err != ESP_OK) {
+            goto cleanup;
+        }
+        off += chunk;
+    }
+    if (prebuf_len > 0) {
+        ESP_LOGI(TAG, "Forwarded %u ms captured during the handshake",
+                 (unsigned)(prebuf_len * 1000 / (VOICE_ASR_SAMPLE_RATE * 2)));
+    }
+
+    /* 4. Keep streaming until the speaker stops or the cap is reached. */
+    while (!released_early && elapsed_ms < ASR_MAX_CAPTURE_MS) {
         size_t bytes_read = 0;
         esp_err_t read_err;
         uint8_t *capture = pcm_chunk[capture_idx];
@@ -568,19 +679,11 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         }
         empty_reads = 0;
 
-        /* Flush the previous chunk now that we know it is not the last one. */
-        if (pending_len > 0) {
-            sequence++;
-            err = asr_send_frame(client, ASR_MSG_AUDIO_ONLY, ASR_SERIAL_NONE, sequence, true,
-                                 pcm_chunk[pending_idx], pending_len);
-            if (err != ESP_OK) {
-                goto cleanup;
-            }
+        err = asr_stage_chunk(client, pcm_chunk, &capture_idx, &pending_idx, &pending_len, &sequence,
+                              capture, bytes_read);
+        if (err != ESP_OK) {
+            goto cleanup;
         }
-
-        pending_idx = capture_idx;
-        pending_len = bytes_read;
-        capture_idx ^= 1;
         captured_bytes += bytes_read;
 
         /* Derive elapsed time from the samples actually captured; a partial
@@ -599,7 +702,7 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         goto cleanup;
     }
 
-    /* 3. The held-back chunk goes out with a negative sequence, which is what
+    /* 5. The held-back chunk goes out with a negative sequence, which is what
      * tells the service the utterance is complete and a result is due. */
     sequence++;
     session.final_sent = true;
@@ -643,6 +746,7 @@ cleanup:
     free(session.rx_buf);
     free(pcm_chunk[0]);
     free(pcm_chunk[1]);
+    free(prebuf);
     free(headers);
     free(config_payload);
     return err;

@@ -42,8 +42,17 @@ esp_err_t voice_status_display_init(void);
 
 void voice_status_display_deinit(void);
 
-/** @brief Draw the face for @p status. Cheap and safe to call when unchanged. */
+/** @brief Draw the label for @p status. Cheap and safe to call when unchanged. */
 void voice_status_display_set(voice_status_t status);
+
+/**
+ * @brief Draw caller-supplied text, wrapped, until the next state change.
+ *
+ * The 5x7 table holds ASCII only, so any multi-byte character renders blank.
+ *
+ * @return ESP_ERR_NOT_FOUND when no panel was detected.
+ */
+esp_err_t voice_status_display_show_text(const char *text);
 
 /* The ASR service only accepts 16 kHz 16-bit mono PCM. */
 #define VOICE_ASR_SAMPLE_RATE 16000

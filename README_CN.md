@@ -33,6 +33,19 @@
 
 </div>
 
+> ### 🎙️ 本分支新增：实时语音交互
+>
+> 在 ESP-Claw 上增加了完整的语音闭环——**按住板载 BOOT 键说话 → 流式识别 → Agent 思考并调用工具 → 喇叭播报答案**，
+> 期间 OLED 显示 `LISTEN` / `THINK` / `TALK` 状态。语音在设计上是与微信、飞书平级的一个输入输出通道，
+> 因此天然复用了 Agent 已有的 LLM 推理、Lua 动态脚本、端侧记忆与联网搜索。
+>
+> - **云端**：火山引擎豆包语音（大模型流式识别 + 单向流式合成），新版控制台单一 API Key
+> - **端侧**：新增 `cap_voice_pipeline` 能力组件，音频取自板卡管理器的 `i2s_audio_in` / `i2s_audio_out`，不直接占用 GPIO
+> - **触发**：按住说话 · IM 发送 `/listen` · 控制台 `cap call voice_listen {}` · Agent 自主调用
+> - **硬件**：ESP32-S3-DevKitC-1 + INMP441 + MAX98357A + 0.91" SSD1306（板型 `esp32_S3_DevKitC_1_voice`）
+>
+> 📄 架构设计、云端选型对比与 25 条踩坑记录见 **[docs/design/voice-pipeline.md](./docs/design/voice-pipeline.md)**
+
 **ESP-Claw** 是乐鑫推出的面向物联网设备的 **Chat Coding「聊天造物」** 式 AI Agent 框架，以对话定义设备行为，在乐鑫芯片上本地完成感知、决策与执行的完整闭环。ESP-Claw 自 OpenClaw 理念出发，用 C 语言重新实现，轻盈、智能、成长。仅需一块几美元的 ESP32 系列芯片，便可体验 ESP-Claw 的轻灵特性。
 
 <div align="center">

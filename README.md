@@ -33,6 +33,23 @@
 
 </div>
 
+> ### 🎙️ Added on this branch: real-time voice interaction
+>
+> A full voice loop on top of ESP-Claw — **hold the on-board BOOT button and speak → streaming
+> recognition → the agent reasons and calls tools → the reply is spoken back**, with the OLED
+> showing `LISTEN` / `THINK` / `TALK` throughout. Voice is designed as an I/O channel on the same
+> footing as WeChat and Feishu, so it reuses the agent's existing LLM reasoning, dynamic Lua
+> scripting, on-device memory and web search for free.
+>
+> - **Cloud**: Volcengine (Doubao) speech — streaming ASR plus unidirectional streaming TTS, one API key
+> - **Device**: a new `cap_voice_pipeline` capability; audio comes from the board manager's
+>   `i2s_audio_in` / `i2s_audio_out`, so the capability never claims GPIOs itself
+> - **Triggers**: push-to-talk · `/listen` from any IM channel · `cap call voice_listen {}` · the agent itself
+> - **Hardware**: ESP32-S3-DevKitC-1 + INMP441 + MAX98357A + 0.91" SSD1306 (board `esp32_S3_DevKitC_1_voice`)
+>
+> 📄 Architecture, the cloud API comparison and 25 recorded pitfalls:
+> **[docs/design/voice-pipeline.md](./docs/design/voice-pipeline.md)**
+
 **ESP-Claw** is Espressif's **Chat Coding** AI agent framework for IoT devices. It defines device behavior through conversation and completes the full loop of sensing, decision-making, and execution locally on Espressif chips. Inspired by the OpenClaw concept and reimplemented in C, ESP-Claw is lightweight, intelligent, and continuously evolving. With just an ESP32-series chip that costs only a few dollars, you can experience what makes ESP-Claw so nimble.
 
 <div align="center">

@@ -28,6 +28,7 @@ typedef enum {
     VOICE_STATUS_LISTENING, /**< Microphone open, streaming to the recognizer. */
     VOICE_STATUS_THINKING,  /**< Transcript handed to the agent, reply pending. */
     VOICE_STATUS_SPEAKING,  /**< Playing the reply through the speaker. */
+    VOICE_STATUS_RETRY,     /**< Nothing usable was captured; ask for a repeat. */
 } voice_status_t;
 
 /**

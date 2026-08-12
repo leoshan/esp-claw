@@ -69,6 +69,10 @@ static const char *TAG = "volcengine_asr";
 #define ASR_SEND_TIMEOUT_MS 5000
 /* Give up rather than spin if the microphone never yields samples. */
 #define ASR_MAX_EMPTY_READS 20
+/* Shorter than this is a stray button tap rather than speech. Bailing out here
+ * skips the pointless wait for a transcript the service cannot produce. */
+#define ASR_MIN_CAPTURE_MS 600
+#define ASR_MIN_CAPTURE_BYTES (VOICE_ASR_SAMPLE_RATE * 2 * ASR_MIN_CAPTURE_MS / 1000)
 /* Longest utterance we will capture before forcing the final packet. */
 #define ASR_MAX_CAPTURE_MS   (CONFIG_CLAW_CAP_VOICE_RECORD_DURATION_SEC * 1000)
 #define ASR_CONNECT_WAIT_MS  10000
@@ -459,6 +463,9 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
     int32_t sequence = 1;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    /* Kept apart from elapsed_ms, which also counts read timeouts: a mic that
+     * only ever times out would otherwise look like it captured speech. */
+    size_t captured_bytes = 0;
 
     if (!config || !out_text || max_text_len == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -574,6 +581,7 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         pending_idx = capture_idx;
         pending_len = bytes_read;
         capture_idx ^= 1;
+        captured_bytes += bytes_read;
 
         /* Derive elapsed time from the samples actually captured; a partial
          * read must not be charged as a full packet. */
@@ -582,6 +590,13 @@ esp_err_t volcengine_asr_stream_recognize(const app_config_t *config,
         if (should_continue && !should_continue()) {
             break;
         }
+    }
+
+    if (captured_bytes < ASR_MIN_CAPTURE_BYTES) {
+        ESP_LOGW(TAG, "Captured only %u ms of audio; too short to be speech",
+                 (unsigned)(captured_bytes * 1000 / (VOICE_ASR_SAMPLE_RATE * 2)));
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
     }
 
     /* 3. The held-back chunk goes out with a negative sequence, which is what

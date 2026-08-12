@@ -5,10 +5,10 @@
  *
  * Status face on a 0.91" 128x32 SSD1306 OLED hanging off the board I2C bus.
  *
- * The panel has no font beyond what we draw ourselves and is only four pixel
- * pages tall, so states are shown as faces built from rectangles and discs
- * rather than as text: a glance tells you whether the device is idle,
- * listening, thinking or talking.
+ * The panel carries no font of its own and is only four pixel pages tall, so
+ * a 5x7 table is drawn here at 3x scale: one short word fills the screen and
+ * stays readable at arm's length. Faces were tried first and read as abstract
+ * shapes at this size.
  */
 #include "sdkconfig.h"
 
@@ -149,87 +149,106 @@ static void fb_rect(int x, int y, int w, int h)
     }
 }
 
-static void fb_disc(int cx, int cy, int r)
+/* ------------------------------------------------------------------ */
+/* Text                                                                */
+/* ------------------------------------------------------------------ */
+
+#define FONT_W       5
+#define FONT_H       7
+#define LABEL_SCALE  3
+#define LABEL_GAP    3
+#define LABEL_CHAR_W (FONT_W * LABEL_SCALE)
+#define LABEL_ADVANCE (LABEL_CHAR_W + LABEL_GAP)
+
+/* Classic 5x7 cell, one byte per column, bit 0 = top row. Only the glyphs the
+ * status words need are stored. */
+static const uint8_t FONT_AZ[26][FONT_W] = {
+    {0x7E, 0x11, 0x11, 0x11, 0x7E}, /* A */
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, /* B */
+    {0x3E, 0x41, 0x41, 0x41, 0x22}, /* C */
+    {0x7F, 0x41, 0x41, 0x22, 0x1C}, /* D */
+    {0x7F, 0x49, 0x49, 0x49, 0x41}, /* E */
+    {0x7F, 0x09, 0x09, 0x09, 0x01}, /* F */
+    {0x3E, 0x41, 0x49, 0x49, 0x7A}, /* G */
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, /* H */
+    {0x00, 0x41, 0x7F, 0x41, 0x00}, /* I */
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, /* J */
+    {0x7F, 0x08, 0x14, 0x22, 0x41}, /* K */
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, /* L */
+    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, /* M */
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, /* N */
+    {0x3E, 0x41, 0x41, 0x41, 0x3E}, /* O */
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, /* P */
+    {0x3E, 0x41, 0x51, 0x21, 0x5E}, /* Q */
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, /* R */
+    {0x46, 0x49, 0x49, 0x49, 0x31}, /* S */
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, /* T */
+    {0x3F, 0x40, 0x40, 0x40, 0x3F}, /* U */
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, /* V */
+    {0x3F, 0x40, 0x38, 0x40, 0x3F}, /* W */
+    {0x63, 0x14, 0x08, 0x14, 0x63}, /* X */
+    {0x07, 0x08, 0x70, 0x08, 0x07}, /* Y */
+    {0x61, 0x51, 0x49, 0x45, 0x43}, /* Z */
+};
+
+static const uint8_t FONT_QUESTION[FONT_W] = {0x02, 0x01, 0x51, 0x09, 0x06};
+static const uint8_t FONT_BLANK[FONT_W] = {0x00, 0x00, 0x00, 0x00, 0x00};
+
+static const uint8_t *font_glyph(char c)
 {
-    for (int dy = -r; dy <= r; dy++) {
-        for (int dx = -r; dx <= r; dx++) {
-            if (dx * dx + dy * dy <= r * r) {
-                fb_pixel(cx + dx, cy + dy);
+    if (c >= 'A' && c <= 'Z') {
+        return FONT_AZ[c - 'A'];
+    }
+    if (c == '?') {
+        return FONT_QUESTION;
+    }
+    return FONT_BLANK;
+}
+
+/** Draw one glyph with every pixel expanded into a LABEL_SCALE square. */
+static void fb_char(int x, int y, char c)
+{
+    const uint8_t *glyph = font_glyph(c);
+
+    for (int col = 0; col < FONT_W; col++) {
+        for (int row = 0; row < FONT_H; row++) {
+            if (glyph[col] & (1u << row)) {
+                fb_rect(x + col * LABEL_SCALE, y + row * LABEL_SCALE, LABEL_SCALE, LABEL_SCALE);
             }
         }
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Faces                                                               */
-/* ------------------------------------------------------------------ */
-
-#define EYE_LEFT_X   46
-#define EYE_RIGHT_X  82
-#define EYE_Y        11
-#define MOUTH_CX     64
-#define MOUTH_Y      23
-
-/** Sleeping: both eyes closed, with rising "z" strokes beside the head. */
-static void draw_idle(void)
+/** Centre a short word on the panel. */
+static void fb_label(const char *text)
 {
-    fb_rect(EYE_LEFT_X - 6, EYE_Y, 13, 2);
-    fb_rect(EYE_RIGHT_X - 6, EYE_Y, 13, 2);
-    fb_rect(MOUTH_CX - 5, MOUTH_Y, 11, 2);
+    size_t len = strlen(text);
+    int width = (int)len * LABEL_ADVANCE - LABEL_GAP;
+    int x = (OLED_WIDTH - width) / 2;
+    int y = (OLED_HEIGHT - FONT_H * LABEL_SCALE) / 2;
 
-    /* Two "z" glyphs of different sizes, drawn as three strokes each. */
-    fb_rect(104, 8, 9, 2);
-    fb_rect(104, 14, 9, 2);
-    for (int i = 0; i < 6; i++) {
-        fb_pixel(111 - i, 9 + i);
+    if (x < 0) {
+        x = 0;
     }
-    fb_rect(116, 2, 6, 2);
-    fb_rect(116, 6, 6, 2);
-    for (int i = 0; i < 4; i++) {
-        fb_pixel(121 - i, 3 + i);
+    for (size_t i = 0; i < len; i++) {
+        fb_char(x + (int)i * LABEL_ADVANCE, y, text[i]);
     }
 }
 
-/** Listening: wide eyes and a level meter suggesting incoming sound. */
-static void draw_listening(void)
+static const char *status_label(voice_status_t status)
 {
-    fb_disc(EYE_LEFT_X, EYE_Y + 1, 4);
-    fb_disc(EYE_RIGHT_X, EYE_Y + 1, 4);
-    fb_rect(MOUTH_CX - 4, MOUTH_Y, 9, 3);
-
-    static const int bar_heights[] = {6, 14, 22, 14, 6};
-    for (int i = 0; i < 5; i++) {
-        int h = bar_heights[i];
-
-        fb_rect(6 + i * 4, (OLED_HEIGHT - h) / 2, 2, h);
-        fb_rect(110 + i * 3, (OLED_HEIGHT - h) / 2, 2, h);
-    }
-}
-
-/** Thinking: eyes glancing up, with trailing dots. */
-static void draw_thinking(void)
-{
-    fb_rect(EYE_LEFT_X - 5, EYE_Y + 4, 11, 2);
-    fb_rect(EYE_RIGHT_X - 5, EYE_Y + 4, 11, 2);
-    fb_disc(EYE_LEFT_X, EYE_Y - 1, 2);
-    fb_disc(EYE_RIGHT_X, EYE_Y - 1, 2);
-    fb_rect(MOUTH_CX - 3, MOUTH_Y, 7, 2);
-
-    for (int i = 0; i < 3; i++) {
-        fb_disc(102 + i * 9, 16, 2);
-    }
-}
-
-/** Speaking: open eyes and an open mouth. */
-static void draw_speaking(void)
-{
-    fb_disc(EYE_LEFT_X, EYE_Y, 4);
-    fb_disc(EYE_RIGHT_X, EYE_Y, 4);
-    fb_disc(MOUTH_CX, MOUTH_Y + 1, 6);
-
-    /* Sound radiating from the right side. */
-    for (int i = 0; i < 3; i++) {
-        fb_rect(104 + i * 7, 14 - i * 4, 3, 5 + i * 8);
+    switch (status) {
+    case VOICE_STATUS_LISTENING:
+        return "LISTEN";
+    case VOICE_STATUS_THINKING:
+        return "THINK";
+    case VOICE_STATUS_SPEAKING:
+        return "TALK";
+    case VOICE_STATUS_RETRY:
+        return "RETRY?";
+    case VOICE_STATUS_IDLE:
+    default:
+        return "IDLE";
     }
 }
 
@@ -342,21 +361,7 @@ void voice_status_display_set(voice_status_t status)
     }
 
     fb_clear();
-    switch (status) {
-    case VOICE_STATUS_LISTENING:
-        draw_listening();
-        break;
-    case VOICE_STATUS_THINKING:
-        draw_thinking();
-        break;
-    case VOICE_STATUS_SPEAKING:
-        draw_speaking();
-        break;
-    case VOICE_STATUS_IDLE:
-    default:
-        draw_idle();
-        break;
-    }
+    fb_label(status_label(status));
 
     err = oled_flush();
     if (err == ESP_OK) {

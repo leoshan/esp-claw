@@ -65,6 +65,7 @@ typedef struct {
     TaskHandle_t tts_task;
     bool initialized;
     bool listening;
+    bool speaking;
     TaskHandle_t record_task;
 } voice_pipeline_state_t;
 
@@ -103,6 +104,19 @@ static bool voice_is_listening_locked_read(void)
     listening = s_voice.listening;
     voice_unlock();
     return listening;
+}
+
+/** Snapshot the speaking flag; see voice_is_listening_locked_read. */
+static bool voice_is_speaking_locked_read(void)
+{
+    bool speaking;
+
+    if (voice_lock() != ESP_OK) {
+        return false;
+    }
+    speaking = s_voice.speaking;
+    voice_unlock();
+    return speaking;
 }
 
 bool cap_voice_pipeline_is_listening(void)
@@ -146,12 +160,21 @@ static void voice_tts_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "Speaking agent reply: '%.60s%s'", request.text,
                  strlen(request.text) > 60 ? "..." : "");
+        if (voice_lock() == ESP_OK) {
+            s_voice.speaking = true;
+            voice_unlock();
+        }
         voice_status_display_set(VOICE_STATUS_SPEAKING);
         voice_speak_locked(request.text);
         free(request.text);
-        /* Only fall back to idle once nothing else is queued, so a multi-part
-         * reply does not flicker through idle between sentences. */
-        if (uxQueueMessagesWaiting(s_voice.tts_queue) == 0) {
+        if (voice_lock() == ESP_OK) {
+            s_voice.speaking = false;
+            voice_unlock();
+        }
+        /* Fall back to idle only when nothing else is going on: another queued
+         * sentence would flicker through idle, and a capture started during
+         * playback owns the panel now. */
+        if (uxQueueMessagesWaiting(s_voice.tts_queue) == 0 && !voice_is_listening_locked_read()) {
             voice_status_display_set(VOICE_STATUS_IDLE);
         }
     }
@@ -253,7 +276,15 @@ static void voice_record_asr_task(void *pvParameters)
         } else {
             ESP_LOGW(TAG, "ASR recognition failed or no speech detected: %s",
                      esp_err_to_name(asr_err));
-            voice_status_display_set(VOICE_STATUS_IDLE);
+            /* Leave the hint up until the next interaction rather than
+             * sleeping here: this task still owns s_voice.listening and
+             * s_voice.record_task, and delaying before clearing them lets a
+             * second press install a new capture that this task then wipes.
+             * Skip it entirely while a reply is playing, so a brushed button
+             * does not replace SPEAKING with an error for the rest of it. */
+            if (!voice_is_speaking_locked_read()) {
+                voice_status_display_set(VOICE_STATUS_RETRY);
+            }
         }
     }
 
@@ -606,6 +637,19 @@ esp_err_t cap_voice_pipeline_start_listening(void)
 esp_err_t cap_voice_pipeline_stop_listening(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+/** Snapshot the speaking flag; see voice_is_listening_locked_read. */
+static bool voice_is_speaking_locked_read(void)
+{
+    bool speaking;
+
+    if (voice_lock() != ESP_OK) {
+        return false;
+    }
+    speaking = s_voice.speaking;
+    voice_unlock();
+    return speaking;
 }
 
 bool cap_voice_pipeline_is_listening(void)

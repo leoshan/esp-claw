@@ -10,10 +10,15 @@
  *
  *     {"code":0,"message":"OK","data":"<base64 pcm>"}
  *
- * Slices are decoded into a PSRAM buffer and played only once the response
- * ends. Feeding them to I2S on arrival sounds broken: the service emits audio
- * at roughly half of real time, so the DMA runs dry between slices and every
- * gap is an audible click.
+ * Slices are decoded into a PSRAM buffer while a separate task drains it to
+ * the speaker, starting once TTS_PREFILL_SECONDS of audio have arrived.
+ *
+ * Playback must not run on the HTTP callback: i2s_channel_write blocks for as
+ * long as the audio lasts, which throttles the TCP receive and starves the DMA
+ * between slices, and every gap is an audible click. With playback decoupled,
+ * measurements on hardware show the service delivering 114-122% of real time,
+ * so a couple of seconds of prefill is enough to keep the buffer ahead without
+ * waiting for the whole utterance.
  */
 #include "sdkconfig.h"
 
@@ -30,6 +35,9 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mbedtls/base64.h"
 
 #include "voice_pipeline_private.h"
@@ -53,6 +61,17 @@ static const char *TAG = "volcengine_tts";
 /* Ceiling on buffered audio: 60 s at 24 kHz 16-bit mono is under 3 MB, which
  * fits PSRAM comfortably while bounding a runaway response. */
 #define TTS_PCM_MAX_BYTES (24000 * 2 * 60)
+/* Start playing once this many seconds are in hand. The producer stays ahead
+ * of real time, so this is margin against jitter rather than a deficit. The
+ * byte count comes from the board's actual rate, since a fixed one would mean
+ * a different amount of audio on any board whose YAML disagrees. */
+#define TTS_PREFILL_SECONDS 2
+/* Frames and ESP_LOG only: the staging buffer is heap-allocated, because
+ * xTaskCreate sizes the stack in bytes on ESP-IDF and TTS_WRITE_CHUNK_BYTES
+ * alone would be twice this. */
+#define TTS_PLAYER_TASK_STACK 4096
+#define TTS_PLAYER_TASK_PRIO  6
+#define TTS_PLAYER_IDLE_MS    20
 
 #define TTS_ERROR_SNIPPET_LEN 200
 
@@ -63,10 +82,7 @@ typedef struct {
     bool overflow;
     esp_err_t play_err;
     size_t total_pcm;
-    /* Decoded audio, accumulated until the response ends. The service emits
-     * slices slower than real time (measured ~40-60% of playback rate), so
-     * writing them to I2S as they arrive starves the DMA between slices and
-     * every gap is audible as a click. */
+    /* Decoded audio. Grows on the HTTP side, drains on the player side. */
     uint8_t *pcm;
     size_t pcm_len;
     size_t pcm_capacity;
@@ -74,6 +90,14 @@ typedef struct {
      * buf cannot be used for this: complete objects are consumed out of it. */
     char error_snippet[TTS_ERROR_SNIPPET_LEN + 1];
     size_t error_snippet_len;
+
+    /* Playback side. pcm may be reallocated as it grows, so the player copies
+     * out under the lock and never holds a pointer into it while writing. */
+    SemaphoreHandle_t lock;
+    SemaphoreHandle_t finished;
+    TaskHandle_t player;
+    bool producer_done;
+    size_t played;
 } tts_stream_t;
 
 /* ------------------------------------------------------------------ */
@@ -122,16 +146,24 @@ static esp_err_t tts_play_pcm(const uint8_t *pcm, size_t pcm_len)
 /** Append one decoded slice to the playback buffer, growing it in PSRAM. */
 static esp_err_t tts_pcm_append(tts_stream_t *stream, const uint8_t *pcm, size_t len)
 {
+    esp_err_t err = ESP_OK;
+
     if (len == 0) {
         return ESP_OK;
     }
+
+    xSemaphoreTake(stream->lock, portMAX_DELAY);
+
     if (stream->pcm_len + len > TTS_PCM_MAX_BYTES) {
         ESP_LOGE(TAG, "Synthesized audio exceeds %d bytes; truncating", TTS_PCM_MAX_BYTES);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto out;
     }
 
     if (stream->pcm_len + len > stream->pcm_capacity) {
         size_t new_cap = stream->pcm_capacity ? stream->pcm_capacity * 2 : (128 * 1024);
+        uint8_t *grown;
+        uint8_t *old_buf;
 
         while (new_cap < stream->pcm_len + len) {
             new_cap *= 2;
@@ -140,23 +172,126 @@ static esp_err_t tts_pcm_append(tts_stream_t *stream, const uint8_t *pcm, size_t
             new_cap = TTS_PCM_MAX_BYTES;
         }
 
-        uint8_t *grown = tts_alloc(new_cap);
-        if (!grown) {
-            ESP_LOGE(TAG, "Failed to grow audio buffer to %u bytes", (unsigned)new_cap);
-            return ESP_ERR_NO_MEM;
-        }
-        if (stream->pcm_len > 0) {
+        /* Allocate and copy with the lock released. At the upper doublings
+         * this moves megabytes through PSRAM, and holding the lock across it
+         * would stall the player long enough to drain the I2S DMA, i.e. the
+         * very click this design removes. Only this task appends, so pcm_len
+         * cannot move underneath us, and the player keeps reading the old
+         * buffer safely until the pointer is swapped. */
+        xSemaphoreGive(stream->lock);
+        grown = tts_alloc(new_cap);
+        if (grown && stream->pcm_len > 0) {
             memcpy(grown, stream->pcm, stream->pcm_len);
         }
-        free(stream->pcm);
+        xSemaphoreTake(stream->lock, portMAX_DELAY);
+
+        if (!grown) {
+            ESP_LOGE(TAG, "Failed to grow audio buffer to %u bytes", (unsigned)new_cap);
+            err = ESP_ERR_NO_MEM;
+            goto out;
+        }
+
+        old_buf = stream->pcm;
         stream->pcm = grown;
         stream->pcm_capacity = new_cap;
+        /* Safe now: any player read in flight held the lock we just retook. */
+        free(old_buf);
     }
 
     memcpy(stream->pcm + stream->pcm_len, pcm, len);
     stream->pcm_len += len;
     stream->total_pcm += len;
-    return ESP_OK;
+
+out:
+    xSemaphoreGive(stream->lock);
+    return err;
+}
+
+/**
+ * Drain the buffer to the speaker as it fills.
+ *
+ * Copies each chunk out under the lock, because the producer may reallocate
+ * the buffer to grow it and a pointer into the old block would dangle.
+ */
+static void tts_player_task(void *arg)
+{
+    tts_stream_t *stream = (tts_stream_t *)arg;
+    uint8_t *stage = malloc(TTS_WRITE_CHUNK_BYTES);
+
+    if (!stage) {
+        xSemaphoreTake(stream->lock, portMAX_DELAY);
+        stream->play_err = ESP_ERR_NO_MEM;
+        xSemaphoreGive(stream->lock);
+        xSemaphoreGive(stream->finished);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true) {
+        size_t chunk = 0;
+        bool done;
+
+        xSemaphoreTake(stream->lock, portMAX_DELAY);
+        if (stream->pcm_len > stream->played) {
+            chunk = stream->pcm_len - stream->played;
+            if (chunk > sizeof(stage)) {
+                chunk = sizeof(stage);
+            }
+            memcpy(stage, stream->pcm + stream->played, chunk);
+        }
+        done = stream->producer_done;
+        xSemaphoreGive(stream->lock);
+
+        if (chunk == 0) {
+            if (done) {
+                break;
+            }
+            /* Underrun: the DMA drains during this wait, which is exactly what
+             * the prefill exists to prevent. */
+            vTaskDelay(pdMS_TO_TICKS(TTS_PLAYER_IDLE_MS));
+            continue;
+        }
+
+        esp_err_t err = tts_play_pcm(stage, chunk);
+        if (err != ESP_OK) {
+            xSemaphoreTake(stream->lock, portMAX_DELAY);
+            stream->play_err = err;
+            xSemaphoreGive(stream->lock);
+            break;
+        }
+        stream->played += chunk;
+    }
+
+    free(stage);
+    xSemaphoreGive(stream->finished);
+    vTaskDelete(NULL);
+}
+
+/** Start playback once enough audio is buffered to ride out jitter. */
+static void tts_player_maybe_start(tts_stream_t *stream, bool force)
+{
+    if (stream->player) {
+        return;
+    }
+    if (!force &&
+        stream->pcm_len < (size_t)(voice_audio_io_get_speaker_sample_rate() * 2 *
+                                   TTS_PREFILL_SECONDS)) {
+        return;
+    }
+    if (stream->pcm_len == 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Starting playback with %u bytes buffered (~%u ms)", (unsigned)stream->pcm_len,
+             (unsigned)(stream->pcm_len * 1000 /
+                        (size_t)(voice_audio_io_get_speaker_sample_rate() * 2)));
+
+    if (xTaskCreate(tts_player_task, "tts_play", TTS_PLAYER_TASK_STACK, stream,
+                    TTS_PLAYER_TASK_PRIO, &stream->player) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create playback task");
+        stream->player = NULL;
+        stream->play_err = ESP_ERR_NO_MEM;
+    }
 }
 
 /** Decode one `{"code":..,"data":"..."}` object into the playback buffer. */
@@ -345,7 +480,12 @@ static esp_err_t tts_http_event_handler(esp_http_client_event_t *evt)
     tts_stream_t *stream = (tts_stream_t *)evt->user_data;
 
     if (evt->event_id == HTTP_EVENT_ON_DATA && stream && evt->data_len > 0) {
-        return tts_stream_append(stream, (const char *)evt->data, (size_t)evt->data_len);
+        esp_err_t err = tts_stream_append(stream, (const char *)evt->data, (size_t)evt->data_len);
+
+        /* Begin speaking as soon as there is a cushion, rather than waiting
+         * for the whole utterance to synthesize. */
+        tts_player_maybe_start(stream, false);
+        return err;
     }
     return ESP_OK;
 }
@@ -540,6 +680,13 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
         return ESP_ERR_NO_MEM;
     }
 
+    stream.lock = xSemaphoreCreateMutex();
+    stream.finished = xSemaphoreCreateBinary();
+    if (!stream.lock || !stream.finished) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
     esp_http_client_config_t http_cfg = {
         .url = url,
         .event_handler = tts_http_event_handler,
@@ -550,8 +697,8 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
 
     client = esp_http_client_init(&http_cfg);
     if (!client) {
-        free(json_body);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto cleanup;
     }
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -563,6 +710,7 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
     esp_http_client_set_post_field(client, json_body, strlen(json_body));
 
     err = esp_http_client_perform(client);
+
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
 
@@ -570,30 +718,48 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
             ESP_LOGE(TAG, "TTS HTTP status %d: %s", status,
                      stream.error_snippet_len ? stream.error_snippet : "(empty body)");
             err = ESP_FAIL;
-        } else if (stream.play_err != ESP_OK) {
-            err = stream.play_err;
         } else if (stream.pcm_len == 0) {
             ESP_LOGE(TAG, "TTS returned no audio");
             err = ESP_ERR_INVALID_RESPONSE;
         } else {
-            unsigned duration_ms =
-                (unsigned)(stream.pcm_len * 1000 /
-                           (size_t)(voice_audio_io_get_speaker_sample_rate() * 2));
-
-            /* Play only now that the whole utterance is in hand, so the I2S
-             * DMA is fed back to back instead of stalling between slices. */
-            ESP_LOGI(TAG, "Playing %u bytes of PCM (~%u ms)", (unsigned)stream.pcm_len,
-                     duration_ms);
-            err = tts_play_pcm(stream.pcm, stream.pcm_len);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "Playback finished");
-            }
+            /* A reply shorter than the prefill never tripped the threshold. */
+            tts_player_maybe_start(&stream, true);
         }
     } else {
         ESP_LOGE(TAG, "TTS HTTP perform failed: %s", esp_err_to_name(err));
     }
 
-    esp_http_client_cleanup(client);
+    /* Tell the player no more audio is coming, then wait for it to drain. */
+    if (stream.player) {
+        xSemaphoreTake(stream.lock, portMAX_DELAY);
+        stream.producer_done = true;
+        xSemaphoreGive(stream.lock);
+
+        /* Unbounded on purpose: every wait inside the player is bounded (the
+         * per-chunk I2S timeout, and a mutex only ever held briefly), so it
+         * always terminates. Giving up here instead would free the lock, the
+         * buffer and this stack frame while the task still points at them. */
+        xSemaphoreTake(stream.finished, portMAX_DELAY);
+        ESP_LOGI(TAG, "Playback finished (%u of %u bytes)", (unsigned)stream.played,
+                 (unsigned)stream.pcm_len);
+    }
+
+    /* Covers the task failing to start as well as failing mid-playback;
+     * without this a failed start returns success having played nothing. */
+    if (err == ESP_OK) {
+        err = stream.play_err;
+    }
+
+cleanup:
+    if (client) {
+        esp_http_client_cleanup(client);
+    }
+    if (stream.lock) {
+        vSemaphoreDelete(stream.lock);
+    }
+    if (stream.finished) {
+        vSemaphoreDelete(stream.finished);
+    }
     free(stream.buf);
     free(stream.pcm);
     free(api_key_header);

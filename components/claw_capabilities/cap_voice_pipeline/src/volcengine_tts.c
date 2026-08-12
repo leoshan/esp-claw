@@ -354,6 +354,114 @@ static esp_err_t tts_http_event_handler(esp_http_client_event_t *evt)
 /* Request construction                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Rewrite markdown into something that reads naturally aloud.
+ *
+ * The service keeps markup verbatim by default, so "**你好**" is spoken as
+ * "星星你好星星". Its `disable_markdown_filter` option would move this
+ * server-side, but the API reference types `additions` as a string while
+ * listing object fields under it, so the wire format is ambiguous. Stripping
+ * here is unambiguous and also covers the model emitting markup despite being
+ * asked not to.
+ *
+ * Markers are all ASCII, so a byte-wise pass is safe for UTF-8 text:
+ * continuation bytes are always >= 0x80 and never collide with them.
+ *
+ * @return heap string the caller frees, or NULL on allocation failure.
+ */
+static char *tts_sanitize_text(const char *text)
+{
+    size_t len = strlen(text);
+    /* Every rule either drops bytes or keeps them, so the input length is an
+     * upper bound on the output. */
+    char *out = malloc(len + 1);
+    size_t o = 0;
+    bool at_line_start = true;
+
+    if (!out) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < len;) {
+        char c = text[i];
+
+        if (at_line_start) {
+            /* Drop heading hashes, block quotes and list bullets, each of
+             * which the engine would otherwise pronounce. */
+            if (c == ' ' || c == '\t') {
+                i++;
+                continue;
+            }
+            if (c == '#') {
+                while (i < len && text[i] == '#') {
+                    i++;
+                }
+                while (i < len && (text[i] == ' ' || text[i] == '\t')) {
+                    i++;
+                }
+                continue;
+            }
+            if (c == '>' && i + 1 < len && (text[i + 1] == ' ' || text[i + 1] == '\t')) {
+                i += 2;
+                continue;
+            }
+            if ((c == '-' || c == '*' || c == '+') && i + 1 < len && text[i + 1] == ' ') {
+                i += 2;
+                continue;
+            }
+            at_line_start = false;
+        }
+
+        /* Emphasis and inline code markers. */
+        if (c == '*' || c == '`') {
+            i++;
+            continue;
+        }
+
+        /* Strikethrough is a doubled tilde. A single one must survive: it is
+         * the usual range separator, and dropping it turns "26~34℃" into
+         * "2634℃". */
+        if (c == '~' && i + 1 < len && text[i + 1] == '~') {
+            i += 2;
+            continue;
+        }
+
+        /* [label](url) -> label; a spoken URL is noise. */
+        if (c == '[') {
+            size_t close = i + 1;
+
+            while (close < len && text[close] != ']' && text[close] != '\n') {
+                close++;
+            }
+            if (close < len && text[close] == ']' && close + 1 < len && text[close + 1] == '(') {
+                size_t paren = close + 2;
+
+                while (paren < len && text[paren] != ')' && text[paren] != '\n') {
+                    paren++;
+                }
+                if (paren < len && text[paren] == ')') {
+                    for (size_t k = i + 1; k < close; k++) {
+                        if (text[k] != '*' && text[k] != '`') {
+                            out[o++] = text[k];
+                        }
+                    }
+                    i = paren + 1;
+                    continue;
+                }
+            }
+        }
+
+        if (c == '\n') {
+            at_line_start = true;
+        }
+        out[o++] = c;
+        i++;
+    }
+
+    out[o] = '\0';
+    return out;
+}
+
 static char *tts_build_request_body(const app_config_t *config, const char *text)
 {
     const char *speaker = config->tts_speaker[0] ? config->tts_speaker : TTS_DEFAULT_SPEAKER;
@@ -395,6 +503,7 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
     const char *resource_id;
     char request_id[40];
     char *json_body = NULL;
+    char *spoken = NULL;
     char *api_key_header = NULL;
     esp_http_client_handle_t client = NULL;
     tts_stream_t stream = {0};
@@ -412,10 +521,21 @@ esp_err_t volcengine_tts_speak(const app_config_t *config, const char *text)
     resource_id = config->tts_resource_id[0] ? config->tts_resource_id : TTS_DEFAULT_RESOURCE_ID;
     tts_build_uuid(request_id, sizeof(request_id));
 
-    ESP_LOGI(TAG, "TTS request: resource=%s text='%.60s%s'", resource_id, text,
-             strlen(text) > 60 ? "..." : "");
+    spoken = tts_sanitize_text(text);
+    if (!spoken) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!spoken[0]) {
+        ESP_LOGW(TAG, "Nothing left to speak after stripping markup");
+        free(spoken);
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    json_body = tts_build_request_body(config, text);
+    ESP_LOGI(TAG, "TTS request: resource=%s text='%.60s%s'", resource_id, spoken,
+             strlen(spoken) > 60 ? "..." : "");
+
+    json_body = tts_build_request_body(config, spoken);
+    free(spoken);
     if (!json_body) {
         return ESP_ERR_NO_MEM;
     }

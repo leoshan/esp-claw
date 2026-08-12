@@ -148,6 +148,18 @@ esp_err_t claw_cap_disable_group(const char *group_id);
 esp_err_t claw_cap_unregister_group(const char *group_id, uint32_t timeout_ms);
 esp_err_t claw_cap_unregister(const char *id_or_name, uint32_t timeout_ms);
 esp_err_t claw_cap_set_llm_visible_groups(const char *const *group_ids, size_t count);
+
+/**
+ * @brief Make one more group visible to the LLM, keeping the existing list.
+ *
+ * claw_cap_set_llm_visible_groups() replaces the whole list and runs once
+ * during startup, so a group registered afterwards is invisible to the model
+ * even though it is registered and callable. This appends instead.
+ *
+ * A no-op when the list is empty, since that already means every group is
+ * visible, and when the group is already present.
+ */
+esp_err_t claw_cap_add_llm_visible_group(const char *group_id);
 esp_err_t claw_cap_set_session_llm_visible_groups(const char *session_id,
                                                   const char *const *group_ids,
                                                   size_t count);

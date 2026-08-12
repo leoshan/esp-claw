@@ -1299,6 +1299,53 @@ esp_err_t claw_cap_set_llm_visible_groups(const char *const *group_ids, size_t c
     return ESP_OK;
 }
 
+esp_err_t claw_cap_add_llm_visible_group(const char *group_id)
+{
+    char **grown = NULL;
+    char *copy = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (!s_runtime.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!group_id || !group_id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    claw_cap_lock();
+
+    /* An empty list already means "everything is visible", so adding one entry
+     * would hide every other group. Leave it alone. */
+    if (s_runtime.llm_visible_group_count == 0) {
+        goto out;
+    }
+    if (claw_cap_group_id_in_list(group_id,
+                                  (const char *const *)s_runtime.llm_visible_group_ids,
+                                  s_runtime.llm_visible_group_count)) {
+        goto out;
+    }
+
+    copy = strdup(group_id);
+    grown = realloc(s_runtime.llm_visible_group_ids,
+                    (s_runtime.llm_visible_group_count + 1) * sizeof(*grown));
+    if (!copy || !grown) {
+        free(copy);
+        free(grown);
+        err = ESP_ERR_NO_MEM;
+        goto out;
+    }
+
+    grown[s_runtime.llm_visible_group_count] = copy;
+    s_runtime.llm_visible_group_ids = grown;
+    s_runtime.llm_visible_group_count++;
+    ESP_LOGI(TAG, "Capability group %s is now LLM-visible (%u total)", group_id,
+             (unsigned)s_runtime.llm_visible_group_count);
+
+out:
+    claw_cap_unlock();
+    return err;
+}
+
 esp_err_t claw_cap_set_session_llm_visible_groups(const char *session_id,
                                                   const char *const *group_ids,
                                                   size_t count)

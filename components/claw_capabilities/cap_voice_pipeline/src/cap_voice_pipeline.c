@@ -611,6 +611,10 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
             goto fail;
         }
     }
+    /* Registration alone is not enough: app_claw fixes the LLM-visible list
+     * during startup, before this runs, so without this the model never sees
+     * these tools even though the console can call them. */
+    claw_cap_add_llm_visible_group(s_voice_group.group_id);
 
     /* Without this the router cannot resolve a delivery capability for
      * VOICE_CHANNEL and every agent reply to a spoken question is dropped with
@@ -631,6 +635,7 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
             claw_cap_unregister_group(s_voice_group.group_id, 0);
             goto fail;
         }
+        claw_cap_add_llm_visible_group(s_display_group.group_id);
     }
 
     /* Observe (never replace) outbound replies so web chat keeps working. */

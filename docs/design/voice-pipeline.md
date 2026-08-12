@@ -101,9 +101,123 @@ graph TB
 
 ---
 
-## 3. 云端方案选型
+## 3. 功能特性清单
 
-### 3.1 ASR：为什么选流式识别而不是录音文件识别
+本分支共 31 个提交、约 3450 行新增代码。按功能域归类如下（✅ 已实测通过，⚠️ 有已知限制）。
+
+### 3.1 语音识别（ASR）
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| 火山引擎 v3 流式识别集成 | ✅ | `wss://.../api/v3/sauc/bigmodel_nostream`，替代初版的 v1 REST 接口 |
+| 自定义二进制协议分帧 | ✅ | 大端序，header/sequence/payload-size 三段，四种消息类型 |
+| 末包负序号标记 | ✅ | 双缓冲始终留一块音频，确保末包携带真实音频而非空包 |
+| 握手与采集并行 | ✅ | 抢救回握手期间约 800 ms 音频，按下即说不再丢开头 |
+| 采集时长下限保护 | ✅ | <600 ms 判定为误触，不发末包、不等转写 |
+| 错误帧正确解析 | ✅ | `header \| error_code \| message_size \| message`，鉴权失败可诊断 |
+| 服务端响应日志 | ✅ | 完整打印 JSON，便于定位服务端问题 |
+| 免按键 VAD 断句 | ⚠️ 未做 | 目前靠按住说话界定句子边界 |
+
+### 3.2 语音合成（TTS）
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| 火山引擎 v3 单向流式合成 | ✅ | `POST /api/v3/tts/unidirectional`，HTTP chunked |
+| chunked JSON 增量切分 | ✅ | 括号配平扫描，跳过字符串内的括号与转义 |
+| base64 解码 + PCM 直推 | ✅ | 不需要 MP3 解码器，采样率取板卡实际配置 |
+| **预缓冲流式播放** | ✅ | 攒够 2 秒即开播，合成等待 12.5 s → 2.3 s |
+| 生产者/消费者解耦 | ✅ | 播放在独立任务，避免阻塞 HTTP 回调导致 DMA 饿死 |
+| **I2S 分块写入** | ✅ | 8 KB 一块，修复整段写入必然超时的缺陷 |
+| **Markdown 过滤** | ✅ | 设备侧清理 `**` / `` ` `` / `#` / 列表 / `[文字](链接)`，避免念成"星星你好星星" |
+| 播放互斥 | ✅ | Agent 回复与 `voice_speak` 工具调用不会在 I2S 上串音 |
+| TTS 任务队列 | ✅ | 回调只入队，不阻塞消息投递任务（原会阻塞最长 20 s） |
+| 成功码兼容 | ✅ | 同时接受 `0` 与线上实际返回的 `20000000` |
+
+### 3.3 音频硬件层
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| 板卡管理器音频接入 | ✅ | `esp_board_periph_ref_handle()` 借用 I2S 通道，capability 不碰 GPIO |
+| 采样率运行时校验 | ✅ | 从板卡配置读取，麦克风非 16 kHz 直接报错退出 |
+| 引脚冲突预检 | ✅ | `esp_gpio_is_reserved()` 预检并点名冲突引脚（IDF 的 I2S 只警告不报错） |
+| **Dummy codec 启动修复** | ✅ | `CONFIG_CODEC_DUMMY_SUPPORT=y`，消除 `audio_dac` 每次启动的三行报错 |
+| 引用计数正确性 | ✅ | `ref_handle` / `unref_handle` 配对，避免板卡 deinit 后留下悬空句柄 |
+
+### 3.4 触发方式
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| **Push-to-talk（按住说话）** | ✅ | 板载 BOOT 键 GPIO 0，无需接线；松手即停，绕开 VAD |
+| **IM `/listen` 指令** | ✅ | 飞书/微信等任意已绑定通道，router 规则实现，无需改 C 代码 |
+| 控制台调用 | ✅ | `cap call voice_listen {}` |
+| Agent 自主调用 | ✅ | `voice_listen` / `voice_stop_listening` / `voice_speak` 三个工具 |
+| 内置 skill 打包 | ✅ | 按键脚本随固件进只读 SYSTEM 镜像，开机 router 规则常驻拉起 |
+| 唤醒词 | ⚠️ 未做 | 需 ESP-SR / WakeNet，模型占 flash、麦克风需常开 |
+
+### 3.5 OLED 状态显示
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| SSD1306 驱动（C 侧） | ✅ | 128×32，页寻址，自建帧缓冲 |
+| I2C 地址自动探测 | ✅ | `i2c_master_probe()` 试 0x3C / 0x3D |
+| **状态显示** | ✅ | `IDLE` / `LISTEN` / `THINK` / `TALK` / `RETRY?` |
+| 5×7 字库 + 缩放渲染 | ✅ | A-Z、0-9、常用标点；状态标签 3 倍、消息 2 倍 |
+| 状态转换互斥 | ✅ | 采集任务与播放任务并发写屏不会撕裂 |
+| 状态优先级 | ✅ | 播报中不被 `RETRY?` 抢屏；多段回复不闪回 IDLE |
+| `display_text` capability | ✅ | Agent 可主动写屏，仅在探测到面板时才注册 |
+| 中文显示 | ⚠️ 不支持 | 5×7 字库无中文字形，capability 描述里已声明 |
+| 纳入板卡管理器 | ⚠️ 未做 | 目前由本组件直驱，Lua 的 `display`/`lcd` 模块用不了它 |
+
+### 3.6 ESP-Claw 框架集成
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| 识别文本投递事件路由 | ✅ | `claw_event_router_publish_message(channel=local)` |
+| **`local` 出站 channel 绑定** | ✅ | 框架原本只绑定了 qq/feishu/telegram/wechat/web，缺 `local` 导致回复被丢弃 |
+| **出站观察者机制** | ✅ | 给 `cap_im_local` 新增观察者列表，语音以观察者接入，不再抢占网页聊天的主回调 |
+| `event_type` 透传 | ✅ | 只播报 `out_message`，不念"正在处理"和每次工具调用的流水账 |
+| **能力对大模型可见** | ✅ | 新增 `claw_cap_add_llm_visible_group()`；原先注册后仍不可见，Agent 完全看不到语音与屏幕工具 |
+| 语音回复长度约束 | ✅ | `soul.md` 按 `source_chat_id: voice_user` 限制五句话，不影响 IM 通道 |
+
+### 3.7 板级支持与配置
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| **新增 `esp32_S3_DevKitC_1_voice` 板型** | ✅ | 独立板卡定义，不改动上游原板型 |
+| I2S 麦克风/喇叭声明 | ✅ | INMP441（I2S0/16 kHz/左声道）+ MAX98357A（I2S1/24 kHz） |
+| I2C OLED 声明 | ✅ | GPIO 41/42 |
+| **16 MB Flash 启用** | ✅ | 原为 8 MB，半片 flash 闲置；应用分区 0x3b6000 → 5 MB |
+| Kconfig 开关真实生效 | ✅ | 关闭后语音代码完全不编译（约省 10 KB） |
+| `CONFIG_WS_BUFFER_SIZE=4096` | ✅ | 默认 1024 装不下 ASR 网关的握手响应头 |
+
+### 3.8 Web 配置界面
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| **语音设置页面** | ✅ | 侧边栏「语音服务 (ASR/TTS)」，SolidJS |
+| 单 API Key 模型 | ✅ | 新版控制台只需一个 `X-Api-Key`，识别与合成共用 |
+| 一键填充默认端点 | ✅ | 页头按钮，仅 API Key 需手填 |
+| 前端类型检查通过 | ✅ | 初版有 37 个类型错误导致页面白屏（`pnpm build` 不做类型检查） |
+| NVS 键名隔离 | ✅ | v3 键名加后缀，避免已配置设备沿用 v1 的 `https://` 地址喂给 WebSocket |
+
+### 3.9 构建与依赖
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| **CMake 依赖修复** | ✅ | 组件 `REQUIRES` 恒定声明（IDF 两次解析，条件声明会静默丢依赖） |
+| `EXTRA_COMPONENT_DIRS` 补齐 | ✅ | 加入 `claw_capabilities` 搜索路径 |
+| 第三方驱动适配 ESP-IDF 6.0 | ✅ | `esp_lcd_gc9107` / `esp_lcd_gc9d01` 的 `rgb_ele_order` 枚举、`ir_learn` 的 `esp_driver_rmt` 依赖 |
+| **改动组件迁入工程目录** | ✅ | 上述三个组件从 `managed_components/` 迁至 `application/edge_agent/components/` 并纳入版本控制——包管理器对改动过的托管组件做哈希校验，会拦截 `idf.py fullclean` |
+| `lua_module_lcd` v6 兼容 | ✅ | `esp_lcd_nt35510` 头文件条件宏保护 |
+
+> **说明**：上述三个第三方驱动**并非新增依赖**，而是原本就由包管理器下载的托管组件（`managed_components/` 在 .gitignore 中）。
+> 因为需要改造以适配 ESP-IDF 6.0，按官方规范迁入工程自有目录并提交，避免哈希校验冲突。
+
+---
+
+## 4. 云端方案选型
+
+### 4.1 ASR：为什么选流式识别而不是录音文件识别
 
 火山引擎提供两类语音识别，形态完全不同：
 
@@ -127,7 +241,7 @@ HTTP 那条路把复杂度转移到了"你得先有个公网文件服务"，工�
 - `bigmodel_async`：双向流式优化版，同上
 - **`bigmodel_nostream`：准确率更高**，末包后返回最终结果 —— 正是我们要的
 
-### 3.2 TTS：为什么选 HTTP 单向流式
+### 4.2 TTS：为什么选 HTTP 单向流式
 
 三种合成接口能力等价，只是传输方式不同：
 
@@ -140,7 +254,7 @@ HTTP 那条路把复杂度转移到了"你得先有个公网文件服务"，工�
 且文档明确写"流式场景推荐使用 pcm"，而 **PCM 正是 I2S 能直接播的格式**——不需要 MP3 解码器。
 合成采样率直接取板卡喇叭通道的实际配置（24 kHz），固件端零重采样。
 
-### 3.3 鉴权
+### 4.3 鉴权
 
 新版控制台只需**一个 `X-Api-Key`**，识别与合成共用。旧版控制台的
 `X-Api-App-Key` + `X-Api-Access-Key` 组合已不需要。
@@ -152,9 +266,9 @@ HTTP 那条路把复杂度转移到了"你得先有个公网文件服务"，工�
 
 ---
 
-## 4. 端侧实现
+## 5. 端侧实现
 
-### 4.1 完整交互时序
+### 5.1 完整交互时序
 
 ```mermaid
 sequenceDiagram
@@ -203,7 +317,7 @@ sequenceDiagram
     VP->>VP: 屏幕 → IDLE
 ```
 
-### 4.2 ASR 二进制协议
+### 5.2 ASR 二进制协议
 
 火山流式识别用自定义二进制帧（整数**大端**）：
 
@@ -227,7 +341,7 @@ payload
 **末包用负序号标记**（标志 `0b0011`），这是"请给我最终结果"的信号。实现上用**双缓冲**
 始终留一块音频不发，等确认没有下一块了，才把它作为负包发出去——保证末包携带真实音频而非空包。
 
-### 4.3 TTS 流式播放的生产者/消费者
+### 5.3 TTS 流式播放的生产者/消费者
 
 ```mermaid
 graph LR
@@ -259,7 +373,7 @@ graph LR
    就是 use-after-free。
 3. **扩容的大块拷贝必须在锁外做**。上层翻倍时是几 MB 的 PSRAM 拷贝，持锁会把播放任务饿死。
 
-### 4.4 状态显示
+### 5.4 状态显示
 
 ```mermaid
 stateDiagram-v2
@@ -279,7 +393,7 @@ stateDiagram-v2
 128×32 单色屏画不了有意义的表情（实测用户反馈"这个看着有点抽象啊"），改用
 **3 倍放大的 5×7 字库**显示 `IDLE` / `LISTEN` / `THINK` / `TALK` / `RETRY?`。
 
-### 4.5 触发方式
+### 5.5 触发方式
 
 | 方式 | 实现 | 说明 |
 | --- | --- | --- |
@@ -293,11 +407,11 @@ stateDiagram-v2
 
 ---
 
-## 5. 踩坑记录
+## 6. 踩坑记录
 
 > 这一节按类别整理开发过程中实际遇到的问题。多数不是"写错一行"，而是**假设与现实不符**。
 
-### 5.1 构建系统
+### 6.1 构建系统
 
 **① 组件 CMakeLists 的 `REQUIRES` 不能用 `if(CONFIG_xxx)` 包起来**
 
@@ -312,7 +426,7 @@ ESP-IDF 会**两次解析**组件 CMakeLists，第一次（依赖展开阶段）
 
 包管理器做哈希校验，检测到文件被改会拦截。正解：把改过的组件迁到工程自有的 `components/` 目录。
 
-### 5.2 硬件与板卡
+### 6.2 硬件与板卡
 
 **④ `slot_mask` 抄错导致采集速率翻倍**
 
@@ -355,7 +469,7 @@ if (!used_by_pair_chan && (esp_gpio_reserve(BIT64(gpio_num)) & BIT64(gpio_num)))
 MAX98357A 是没有控制接口的裸功放，板卡管理器用 "dummy" codec 承载它，但该条目
 默认不编进注册表，导致每次启动报 `Unsupported codec: dummy` + `Failed to init device: audio_dac`。
 
-### 5.3 协议与云服务
+### 6.3 协议与云服务
 
 **⑨ `CONFIG_WS_BUFFER_SIZE` 默认 1024 太小**
 
@@ -384,7 +498,7 @@ HTTP 回调里，`i2s_channel_write` 阻塞回调**反过来节流了 TCP 接收
 
 **教训**：测量前先确认测的是被测对象，而不是自己的实现。
 
-### 5.4 并发与内存
+### 6.4 并发与内存
 
 **⑬ ESP-IDF 的 `xTaskCreate` 栈大小单位是字节，不是字**
 
@@ -415,7 +529,7 @@ memcpy 已释放的内存、写已被复用的栈帧。而 60 秒的音频上限
 `main.c` 把 `s_config` 传进来，却在 `app_main` 结尾 `free()` 掉。语音管线一直持有这个指针，
 之后每次读 API Key 都是读已释放内存。（`app_claw_start` 是拷贝的，只有这个 capability 是例外。）
 
-### 5.5 集成与可见性
+### 6.5 集成与可见性
 
 **⑰ 注册 capability ≠ 大模型能看见它**
 
@@ -446,7 +560,7 @@ memcpy 已释放的内存、写已被复用的栈帧。而 60 秒的音频上限
 好在路由器的 payload 里已经带了 `event_type`，只是 `cap_im_local` 把它丢掉了——
 接出来后过滤 `out_message` 即可。
 
-### 5.6 延迟与体验
+### 6.6 延迟与体验
 
 **⑳ 先建连再采集 = 丢掉开头半秒语音**
 
@@ -492,9 +606,9 @@ v1 → v3 迁移时若沿用 `asr_base_url` 等键名，**已存的值优先于�
 
 ---
 
-## 6. 配置指南
+## 7. 配置指南
 
-### 6.1 板卡与构建
+### 7.1 板卡与构建
 
 ```bash
 export IDF_PATH='/Users/leoshan/.espressif/v6.0.2/esp-idf'
@@ -507,7 +621,7 @@ idf.py build
 idf.py -p /dev/cu.usbmodem11301 flash monitor
 ```
 
-### 6.2 接线
+### 7.2 接线
 
 | 器件 | 引脚 |
 | --- | --- |
@@ -516,7 +630,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 | SSD1306 OLED | SDA=41, SCL=42（I2C, 0x3C 或 0x3D 自动探测） |
 | 按键 | BOOT 键 GPIO 0（板载，无需接线） |
 
-### 6.3 云端配置
+### 7.3 云端配置
 
 网页配置页 →「语音服务 (ASR / TTS)」，**只需填 1 个 API Key**：
 
@@ -529,7 +643,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 | TTS 音色 | `zh_female_vv_uranus_bigtts` |
 | TTS 服务地址 | `https://openspeech.bytedance.com/api/v3/tts/unidirectional` |
 
-### 6.4 关键 Kconfig
+### 7.4 关键 Kconfig
 
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
@@ -541,7 +655,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 
 ---
 
-## 7. 性能实测
+## 8. 性能实测
 
 | 指标 | 数值 |
 | --- | --- |
@@ -562,7 +676,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 
 ---
 
-## 8. 已知限制与后续工作
+## 9. 已知限制与后续工作
 
 | 项 | 说明 |
 | --- | --- |

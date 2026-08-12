@@ -20,6 +20,29 @@ extern "C" {
 /* Board-manager peripheral names declared in board_peripherals.yaml. */
 #define VOICE_PERIPH_MIC     "i2s_audio_in"
 #define VOICE_PERIPH_SPEAKER "i2s_audio_out"
+#define VOICE_PERIPH_I2C     "i2c_master"
+
+/** What the status display is showing. */
+typedef enum {
+    VOICE_STATUS_IDLE = 0,  /**< Waiting for someone to talk. */
+    VOICE_STATUS_LISTENING, /**< Microphone open, streaming to the recognizer. */
+    VOICE_STATUS_THINKING,  /**< Transcript handed to the agent, reply pending. */
+    VOICE_STATUS_SPEAKING,  /**< Playing the reply through the speaker. */
+} voice_status_t;
+
+/**
+ * @brief Bring up the optional SSD1306 status OLED on the board's I2C bus.
+ *
+ * The display is a convenience, not a requirement: a board without an
+ * `i2c_master` peripheral or without a panel answering at the configured
+ * address simply runs without it.
+ */
+esp_err_t voice_status_display_init(void);
+
+void voice_status_display_deinit(void);
+
+/** @brief Draw the face for @p status. Cheap and safe to call when unchanged. */
+void voice_status_display_set(voice_status_t status);
 
 /* The ASR service only accepts 16 kHz 16-bit mono PCM. */
 #define VOICE_ASR_SAMPLE_RATE 16000

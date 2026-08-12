@@ -146,8 +146,14 @@ static void voice_tts_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "Speaking agent reply: '%.60s%s'", request.text,
                  strlen(request.text) > 60 ? "..." : "");
+        voice_status_display_set(VOICE_STATUS_SPEAKING);
         voice_speak_locked(request.text);
         free(request.text);
+        /* Only fall back to idle once nothing else is queued, so a multi-part
+         * reply does not flicker through idle between sentences. */
+        if (uxQueueMessagesWaiting(s_voice.tts_queue) == 0) {
+            voice_status_display_set(VOICE_STATUS_IDLE);
+        }
     }
 
     s_voice.tts_task = NULL;
@@ -224,6 +230,7 @@ static void voice_record_asr_task(void *pvParameters)
 
     (void)pvParameters;
     ESP_LOGI(TAG, "Voice capture started (max %d s)", VOICE_RECORD_DURATION_SEC);
+    voice_status_display_set(VOICE_STATUS_LISTENING);
 
     /* Kept off the task stack: 512 bytes far exceeds the 128-byte stack budget. */
     text_out = calloc(1, VOICE_ASR_TEXT_MAX);
@@ -240,10 +247,13 @@ static void voice_record_asr_task(void *pvParameters)
 
         if (asr_err == ESP_OK && text_out[0] != '\0') {
             ESP_LOGI(TAG, "ASR result: '%s'", text_out);
+            /* The agent owns the turn from here until its reply comes back. */
+            voice_status_display_set(VOICE_STATUS_THINKING);
             voice_publish_recognized_text(text_out);
         } else {
             ESP_LOGW(TAG, "ASR recognition failed or no speech detected: %s",
                      esp_err_to_name(asr_err));
+            voice_status_display_set(VOICE_STATUS_IDLE);
         }
     }
 
@@ -477,6 +487,9 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
      * app_main, so every later credential read would hit freed memory. */
     memcpy(&s_voice.config, config, sizeof(s_voice.config));
 
+    /* Optional: a board without the panel just runs without status faces. */
+    voice_status_display_init();
+
     if (xTaskCreate(voice_tts_task, "v_tts", VOICE_TTS_TASK_STACK, NULL, VOICE_TTS_TASK_PRIO,
                     &s_voice.tts_task) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create TTS playback task");
@@ -557,6 +570,7 @@ esp_err_t cap_voice_pipeline_deinit(void)
         }
     }
 
+    voice_status_display_deinit();
     voice_audio_io_deinit();
 
     if (voice_lock() == ESP_OK) {

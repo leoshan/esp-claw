@@ -40,6 +40,7 @@ static const char *TAG = "cap_ble_trigger";
 
 typedef enum {
     BLE_TRIGGER_MSG_EDGE = 0, /**< A press or release that changed state. */
+    BLE_TRIGGER_MSG_TAP,      /**< One push with no hold; toggle capture. */
     BLE_TRIGGER_MSG_SCAN,     /**< Look for a HID button to connect to. */
 } ble_trigger_msg_kind_t;
 
@@ -95,7 +96,12 @@ static void ble_trigger_unlock(void)
 static void ble_trigger_hold_expired(void *arg)
 {
     (void)arg;
-    ESP_LOGW(TAG, "No release after %d ms; stopping capture", BLE_TRIGGER_HOLD_TIMEOUT_MS);
+
+    /* Capture usually ends on its own at the recording cap well before this
+     * fires, so only a still-open microphone is worth warning about. */
+    if (cap_voice_pipeline_is_listening()) {
+        ESP_LOGW(TAG, "No release after %d ms; stopping capture", BLE_TRIGGER_HOLD_TIMEOUT_MS);
+    }
     ble_trigger_report(s_state.last_source, false);
 }
 
@@ -125,6 +131,31 @@ static void ble_trigger_task(void *arg)
 
     while (xQueueReceive(s_state.queue, &msg, portMAX_DELAY) == pdTRUE) {
         esp_err_t err;
+
+        if (msg.kind == BLE_TRIGGER_MSG_TAP) {
+            bool listening = cap_voice_pipeline_is_listening();
+
+            ESP_LOGI(TAG, "[%s] tap -> %s", ble_trigger_source_name(msg.source),
+                     listening ? "stop" : "start");
+            if (listening) {
+                err = cap_voice_pipeline_stop_listening();
+            } else {
+                err = cap_voice_pipeline_start_listening();
+            }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "tap failed: %s", esp_err_to_name(err));
+            }
+            /* Keep the held flag honest for anyone reading it, and make sure a
+             * stale hold timer cannot stop a capture this tap just started. */
+            if (ble_trigger_lock() == ESP_OK) {
+                s_state.pressed = false;
+                ble_trigger_unlock();
+            }
+            if (s_state.hold_timer) {
+                (void)esp_timer_stop(s_state.hold_timer);
+            }
+            continue;
+        }
 
         if (msg.kind == BLE_TRIGGER_MSG_SCAN) {
             err = ble_trigger_hidh_scan(CONFIG_CLAW_CAP_BLE_TRIGGER_HID_SCAN_SEC, NULL, 0);
@@ -200,14 +231,21 @@ void ble_trigger_report(ble_trigger_source_t source, bool pressed)
 
 void ble_trigger_report_tap(ble_trigger_source_t source)
 {
-    /* A tap carries no hold duration, so treat it as a toggle: start capture
-     * if idle, end it if running. That makes one-event remotes usable, at the
-     * cost of needing two pushes per utterance. */
-    bool listening = cap_voice_pipeline_is_listening();
+    ble_trigger_msg_t msg = {.kind = BLE_TRIGGER_MSG_TAP, .source = source};
 
-    ESP_LOGI(TAG, "[%s] tap -> %s", ble_trigger_source_name(source),
-             listening ? "stop" : "start");
-    ble_trigger_report(source, !listening);
+    if (!s_state.initialized) {
+        return;
+    }
+
+    /* A tap carries no hold duration, so it toggles: start capture if idle,
+     * end it if running. Deliberately not routed through ble_trigger_report:
+     * that edge-detects against the held flag, and capture ending on its own
+     * at the recording cap leaves the flag set, which swallowed the next tap
+     * until the hold timeout cleared it. The worker reads the pipeline
+     * instead, which is the only thing that actually knows. */
+    if (xQueueSend(s_state.queue, &msg, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "Trigger queue full; dropping tap");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -223,11 +261,12 @@ static esp_err_t cap_ble_trigger_execute_status(const char *input_json,
 
     snprintf(output, output_size,
              "{\"ok\":true,\"stack\":%s,\"advertising_name\":\"%s\",\"phone_connected\":%s,"
-             "\"hid_button_connected\":%s,\"pressed\":%s,\"press_count\":%u}",
+             "\"hid_button_connected\":%s,\"listening\":%s,\"press_count\":%u}",
              ble_trigger_stack_is_running() ? "true" : "false", BLE_TRIGGER_DEVICE_NAME,
              ble_trigger_peripheral_is_connected() ? "true" : "false",
              ble_trigger_hidh_is_connected() ? "true" : "false",
-             s_state.pressed ? "true" : "false", (unsigned)s_state.press_count);
+             cap_voice_pipeline_is_listening() ? "true" : "false",
+             (unsigned)s_state.press_count);
     return ESP_OK;
 }
 

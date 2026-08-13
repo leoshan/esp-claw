@@ -607,10 +607,10 @@ static const claw_cap_descriptor_t s_voice_descriptors[] = {
         .id = "voice_set_volume",
         .name = "voice_set_volume",
         .family = "voice",
-        .description = "Set the speaker volume for spoken replies, 0 (silent) to 100 (loudest). "
-                       "The setting is applied immediately and persists across reboots. This is "
-                       "the only way to change volume on this device; the audio Lua module's "
-                       "set_volume has no effect and disables the speaker until reboot.",
+        .description = "Set the speaker volume for spoken replies, 0 (silent) to 100. Applies at "
+                       "once and survives reboots. This is the only way to change volume here: "
+                       "the audio Lua module's set_volume does nothing on this board and leaves "
+                       "the speaker dead until reboot.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
@@ -634,12 +634,13 @@ static const claw_cap_descriptor_t s_display_descriptors[] = {
         .id = "display_text",
         .name = "display_text",
         .family = "display",
+        /* Keep under CLAW_CAP_TOOL_DESCRIPTION_MAX (256): the registry cuts
+         * the overflow off mid-sentence, which drops whatever guidance sits
+         * at the end -- here, the part that stops the model writing Chinese. */
         .description =
-            "Write a short message to the device's 128x32 monochrome OLED. It replaces whatever "
-            "is on screen and holds until the voice pipeline changes state (listening, thinking, "
-            "speaking). Only ASCII renders: about 10 characters per line over two lines, "
-            "lowercase is shown as uppercase, and Chinese or emoji come out blank, so write short "
-            "English or digits.",
+            "Show a short message on the device's 128x32 OLED, until the voice state next "
+            "changes. ASCII only, about 10 characters per line over 2 lines, rendered "
+            "uppercase; Chinese and emoji come out blank, so write short English or digits.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =

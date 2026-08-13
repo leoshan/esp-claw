@@ -32,6 +32,9 @@
 #if CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED
 #include "cap_voice_pipeline.h"
 #endif
+#if CONFIG_CLAW_CAP_BLE_TRIGGER_ENABLED
+#include "cap_ble_trigger.h"
+#endif
 
 #define APP_ENABLE_MEM_LOG        (0)
 
@@ -425,6 +428,17 @@ void app_main(void)
 
         if (voice_err != ESP_OK) {
             ESP_LOGW(TAG, "Voice pipeline unavailable: %s", esp_err_to_name(voice_err));
+        }
+    }
+#endif
+#if CONFIG_CLAW_CAP_BLE_TRIGGER_ENABLED
+    /* Wireless push-to-talk. Optional in exactly the same way as voice: a
+     * failure here must not stop the agent, it only costs the BLE button. */
+    {
+        esp_err_t ble_err = cap_ble_trigger_init();
+
+        if (ble_err != ESP_OK) {
+            ESP_LOGW(TAG, "BLE trigger unavailable: %s", esp_err_to_name(ble_err));
         }
     }
 #endif

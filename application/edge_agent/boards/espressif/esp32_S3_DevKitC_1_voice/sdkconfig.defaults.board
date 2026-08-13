@@ -35,3 +35,25 @@ CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED=y
 # Note esp_websocket_client_config_t.buffer_size is a different buffer (frame
 # payloads) and does not affect this.
 CONFIG_WS_BUFFER_SIZE=4096
+
+# Wireless push-to-talk over BLE.
+#
+# The project default (application/edge_agent/sdkconfig.defaults) turns the
+# central and observer roles off, which only leaves the peripheral side: the
+# device could pretend to BE a keyboard but could never scan for or connect to
+# one. A HID button needs the opposite direction, so re-enable them here.
+CONFIG_CLAW_CAP_BLE_TRIGGER_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_GATT_CLIENT=y
+
+# esp_hid's nimble_hidh.c is compiled to an empty translation unit without
+# this: the whole file sits behind #if CONFIG_BT_NIMBLE_HID_SERVICE.
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+
+# Two links at once: the phone (or another GATT client) on the peripheral side
+# and the HID button on the central side. The project default of 1 would let
+# whichever connected first lock the other out.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+CONFIG_BT_NIMBLE_MAX_BONDS=4
+CONFIG_BT_NIMBLE_MAX_CCCDS=4

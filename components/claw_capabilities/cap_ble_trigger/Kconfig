@@ -1,0 +1,68 @@
+menu "BLE Trigger Capability Configuration"
+
+config CLAW_CAP_BLE_TRIGGER_ENABLED
+    bool "Enable BLE Trigger Capability"
+    default n
+    depends on CLAW_CAP_VOICE_PIPELINE_ENABLED
+    help
+        Wireless push-to-talk: a remote BLE press starts voice capture and the
+        matching release stops it, exactly as the on-board button does.
+
+        Two sources feed the same trigger, and both can run at once:
+
+          * A GATT service this device advertises. Any BLE debugging app can
+            connect and write the trigger byte, which makes a phone usable as
+            the button and is the only way to exercise this without hardware.
+
+          * A BLE HID button (HOGP, service 0x1812) this device connects out
+            to, for a real physical remote.
+
+        Requires NimBLE with the central and observer roles enabled. This
+        capability owns the NimBLE stack, so it cannot run alongside the `ble`
+        or `ble_hid` Lua modules, which each own the stack themselves.
+
+if CLAW_CAP_BLE_TRIGGER_ENABLED
+
+config CLAW_CAP_BLE_TRIGGER_DEVICE_NAME
+    string "Advertised device name"
+    default "esp-claw-mic"
+    help
+        Name shown in the scan list of the phone app that connects to write
+        the trigger byte.
+
+config CLAW_CAP_BLE_TRIGGER_ADVERTISE
+    bool "Advertise the trigger GATT service"
+    default y
+    help
+        Turn off once a physical HID button is in use and no phone needs to
+        connect, to stop advertising and free the connection slot.
+
+config CLAW_CAP_BLE_TRIGGER_HID_HOST
+    bool "Connect to BLE HID buttons"
+    default y
+    help
+        Scan for peripherals advertising the HID service (0x1812) and treat
+        their input reports as button presses.
+
+config CLAW_CAP_BLE_TRIGGER_HID_SCAN_SEC
+    int "HID scan window (seconds)"
+    default 8
+    range 2 30
+    depends on CLAW_CAP_BLE_TRIGGER_HID_HOST
+    help
+        How long one scan runs. Scanning competes with Wi-Fi for the radio, so
+        this never runs on a timer: it happens at startup and whenever
+        ble_trigger_scan is called.
+
+config CLAW_CAP_BLE_TRIGGER_HOLD_TIMEOUT_MS
+    int "Maximum hold time (milliseconds)"
+    default 15000
+    range 1000 60000
+    help
+        A press with no matching release stops capture anyway after this long.
+        Without it a dropped link mid-press would leave the microphone open
+        until the recording cap expires.
+
+endif
+
+endmenu

@@ -16,6 +16,7 @@ type VoiceForm = {
   tts_resource_id: string;
   tts_speaker: string;
   tts_base_url: string;
+  voice_volume: string;
 };
 
 /** Volcengine (Doubao) endpoints this firmware speaks. */
@@ -26,6 +27,16 @@ const VOLCENGINE_DEFAULTS = {
   tts_speaker: 'zh_female_vv_uranus_bigtts',
   tts_base_url: 'https://openspeech.bytedance.com/api/v3/tts/unidirectional',
 } as const;
+
+/** Software attenuation only; see cap_voice_pipeline's voice_audio_io. */
+const clampVolume = (value: string): number => {
+  const parsed = Number.parseInt(value, 10);
+
+  if (Number.isNaN(parsed)) {
+    return 100;
+  }
+  return Math.min(100, Math.max(0, parsed));
+};
 
 export const VoicePage: Component = () => {
   const tab = createConfigTab<VoiceForm>({
@@ -38,6 +49,7 @@ export const VoicePage: Component = () => {
       tts_resource_id: config.tts_resource_id ?? '',
       tts_speaker: config.tts_speaker ?? '',
       tts_base_url: config.tts_base_url ?? '',
+      voice_volume: config.voice_volume ?? '100',
     }),
     fromForm: (form) => ({
       voice_api_key: form.voice_api_key.trim(),
@@ -46,6 +58,10 @@ export const VoicePage: Component = () => {
       tts_resource_id: form.tts_resource_id.trim(),
       tts_speaker: form.tts_speaker.trim(),
       tts_base_url: form.tts_base_url.trim(),
+      /* Clamp here rather than rejecting the save: the firmware ignores an
+       * out-of-range value and keeps the old volume, which would look like the
+       * save silently did nothing. */
+      voice_volume: String(clampVolume(form.voice_volume)),
     }),
   });
 
@@ -122,6 +138,19 @@ export const VoicePage: Component = () => {
             hint="单向流式合成，音频边合成边播放。"
             value={tab.form.tts_base_url}
             onInput={(event) => tab.setForm('tts_base_url', event.currentTarget.value)}
+          />
+        </div>
+      </StaticConfigBlock>
+
+      <StaticConfigBlock title="播放">
+        <div class="grid gap-3 sm:grid-cols-2">
+          <TextInput
+            type="number"
+            label="音量 (0-100)"
+            placeholder="100"
+            hint="本机功放（MAX98357A 一类）没有增益接口，音量由固件在送进 I2S 前对 PCM 做衰减实现。50 约为 -12 dB。请勿用 audio Lua 模块调音量：那会关闭编解码设备并禁用 I2S 通道。"
+            value={tab.form.voice_volume}
+            onInput={(event) => tab.setForm('voice_volume', event.currentTarget.value)}
           />
         </div>
       </StaticConfigBlock>

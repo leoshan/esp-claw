@@ -234,13 +234,18 @@ static void tts_player_task(void *arg)
         xSemaphoreTake(stream->lock, portMAX_DELAY);
         if (stream->pcm_len > stream->played) {
             chunk = stream->pcm_len - stream->played;
-            if (chunk > sizeof(stage)) {
-                chunk = sizeof(stage);
+            if (chunk > TTS_WRITE_CHUNK_BYTES) {
+                chunk = TTS_WRITE_CHUNK_BYTES;
             }
             memcpy(stage, stream->pcm + stream->played, chunk);
         }
         done = stream->producer_done;
         xSemaphoreGive(stream->lock);
+
+        /* Attenuate the private copy, never stream->pcm: the buffer is the
+         * record of what was synthesized, and scaling it in place would
+         * compound on any replay. */
+        voice_audio_io_apply_volume((int16_t *)stage, chunk / sizeof(int16_t));
 
         if (chunk == 0) {
             if (done) {

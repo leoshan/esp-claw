@@ -82,6 +82,23 @@ int voice_audio_io_get_speaker_sample_rate(void);
 /** @brief Sample rate the board configured the microphone channel with, in Hz. */
 int voice_audio_io_get_mic_sample_rate(void);
 
+/* Playback volume is applied in software. The reference board drives a
+ * MAX98357A, a fixed-gain class-D amplifier with no control interface, so the
+ * board manager builds a dummy codec whose set_vol is NULL and installs no
+ * software volume handler -- esp_codec_dev_set_out_vol() there returns
+ * NOT_SUPPORT and changes nothing. Scaling the PCM before it reaches the DMA
+ * is the only volume control this class of board has. */
+#define VOICE_VOLUME_MAX     100
+#define VOICE_VOLUME_DEFAULT 100
+
+/** @brief Set playback volume, 0 (silent) to VOICE_VOLUME_MAX (unattenuated). */
+esp_err_t voice_audio_io_set_volume(int percent);
+
+int voice_audio_io_get_volume(void);
+
+/** @brief Attenuate @p sample_count 16-bit mono samples in place. */
+void voice_audio_io_apply_volume(int16_t *samples, size_t sample_count);
+
 /**
  * @brief Pull one utterance through the streaming ASR service.
  *

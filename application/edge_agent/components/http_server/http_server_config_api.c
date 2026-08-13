@@ -83,6 +83,7 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("voice",        tts_resource_id),
     CONFIG_FIELD("voice",        tts_speaker),
     CONFIG_FIELD("voice",        tts_base_url),
+    CONFIG_FIELD("voice",        voice_volume),
 };
 
 static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);

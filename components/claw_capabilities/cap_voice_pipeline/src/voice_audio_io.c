@@ -29,6 +29,10 @@ static bool s_speaker_referenced = false;
 static int s_mic_sample_rate = 0;
 static int s_speaker_sample_rate = 0;
 
+/* Playback attenuation as a Q15 multiplier. See voice_audio_io_set_volume. */
+static int s_volume_percent = VOICE_VOLUME_DEFAULT;
+static int32_t s_volume_q15 = 1 << 15;
+
 /**
  * Read the sample rate the board actually configured for a peripheral.
  *
@@ -148,21 +152,138 @@ int voice_audio_io_get_mic_sample_rate(void)
     return s_mic_sample_rate;
 }
 
+/**
+ * Put a channel someone else shut down back the way the board configured it.
+ *
+ * The board manager hands out one i2s_chan_handle_t per peripheral, so every
+ * other user of that peripheral operates on the very handle held here. The
+ * Lua audio module is the one that bites: audio.new_output{} opens the codec
+ * device, and closing it (explicitly or from __gc) reaches
+ * esp_codec_dev_close -> data_if->enable(false) -> i2s_channel_disable() on
+ * this channel. Nothing ever re-enables it, so every later read or write
+ * fails with ESP_ERR_INVALID_STATE until the board reboots.
+ *
+ * Opening the codec also reprograms the clock and slots to whatever format
+ * the other user asked for, which is why this reapplies the board's own
+ * config rather than just calling i2s_channel_enable().
+ */
+static esp_err_t voice_audio_io_rearm(const char *periph_name, i2s_chan_handle_t chan)
+{
+    periph_i2s_config_t *cfg = NULL;
+    esp_err_t err = esp_board_manager_get_periph_config(periph_name, (void **)&cfg);
+
+    if (err != ESP_OK || !cfg || cfg->mode != I2S_COMM_MODE_STD) {
+        ESP_LOGE(TAG, "Cannot re-arm '%s': board config unavailable", periph_name);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Reconfiguring is rejected while the channel is running, and the channel
+     * may be enabled here if the format alone drifted, so always disable. */
+    i2s_channel_disable(chan);
+
+    err = i2s_channel_reconfig_std_clock(chan, &cfg->i2s_cfg.std.clk_cfg);
+    if (err == ESP_OK) {
+        err = i2s_channel_reconfig_std_slot(chan, &cfg->i2s_cfg.std.slot_cfg);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot restore '%s' format: %s", periph_name, esp_err_to_name(err));
+        return err;
+    }
+
+    err = i2s_channel_enable(chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot re-enable '%s': %s", periph_name, esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGW(TAG, "Re-armed '%s': another component had disabled the channel", periph_name);
+    return ESP_OK;
+}
+
+/**
+ * @brief True when @p chan is not in the running state.
+ *
+ * i2s_channel_read/write report a disabled channel and a concurrent transfer
+ * on the same channel with the same error, so the distinction has to come
+ * from the driver's own view. Only the first case is ours to repair.
+ */
+static bool voice_audio_io_channel_down(i2s_chan_handle_t chan)
+{
+    i2s_chan_info_t info = {0};
+
+    if (i2s_channel_get_info(chan, &info) != ESP_OK) {
+        return false;
+    }
+    return !info.is_enabled;
+}
+
 esp_err_t voice_audio_io_read(void *dest, size_t size, size_t *bytes_read, uint32_t timeout_ms)
 {
+    esp_err_t err;
+
     if (!s_rx_chan) {
         return ESP_ERR_INVALID_STATE;
     }
-    return i2s_channel_read(s_rx_chan, dest, size, bytes_read, pdMS_TO_TICKS(timeout_ms));
+
+    err = i2s_channel_read(s_rx_chan, dest, size, bytes_read, pdMS_TO_TICKS(timeout_ms));
+    if (err == ESP_ERR_INVALID_STATE && voice_audio_io_channel_down(s_rx_chan) &&
+        voice_audio_io_rearm(VOICE_PERIPH_MIC, s_rx_chan) == ESP_OK) {
+        err = i2s_channel_read(s_rx_chan, dest, size, bytes_read, pdMS_TO_TICKS(timeout_ms));
+    }
+    return err;
 }
 
 esp_err_t voice_audio_io_write(const void *src, size_t size, size_t *bytes_written,
                                uint32_t timeout_ms)
 {
+    esp_err_t err;
+
     if (!s_tx_chan) {
         return ESP_ERR_INVALID_STATE;
     }
-    return i2s_channel_write(s_tx_chan, src, size, bytes_written, pdMS_TO_TICKS(timeout_ms));
+
+    err = i2s_channel_write(s_tx_chan, src, size, bytes_written, pdMS_TO_TICKS(timeout_ms));
+    if (err == ESP_ERR_INVALID_STATE && voice_audio_io_channel_down(s_tx_chan) &&
+        voice_audio_io_rearm(VOICE_PERIPH_SPEAKER, s_tx_chan) == ESP_OK) {
+        err = i2s_channel_write(s_tx_chan, src, size, bytes_written, pdMS_TO_TICKS(timeout_ms));
+    }
+    return err;
+}
+
+/* ------------------------------------------------------------------ */
+/* Playback volume                                                     */
+/* ------------------------------------------------------------------ */
+
+esp_err_t voice_audio_io_set_volume(int percent)
+{
+    if (percent < 0 || percent > VOICE_VOLUME_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Squaring the fraction approximates a perceptual taper: half volume
+     * lands near -12 dB, which sounds like "half" far better than the -6 dB
+     * a linear scale would give. Gain never exceeds 1.0, so scaled samples
+     * cannot overflow and no clipping guard is needed. */
+    s_volume_percent = percent;
+    s_volume_q15 = ((int32_t)percent * percent * (1 << 15)) / (VOICE_VOLUME_MAX * VOICE_VOLUME_MAX);
+    return ESP_OK;
+}
+
+int voice_audio_io_get_volume(void)
+{
+    return s_volume_percent;
+}
+
+void voice_audio_io_apply_volume(int16_t *samples, size_t sample_count)
+{
+    int32_t gain = s_volume_q15;
+
+    if (gain >= (1 << 15) || !samples) {
+        return;
+    }
+    for (size_t i = 0; i < sample_count; i++) {
+        samples[i] = (int16_t)(((int32_t)samples[i] * gain) >> 15);
+    }
 }
 
 #endif /* CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED */

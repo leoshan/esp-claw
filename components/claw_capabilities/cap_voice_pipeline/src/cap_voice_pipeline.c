@@ -127,6 +127,57 @@ bool cap_voice_pipeline_is_listening(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Playback volume                                                     */
+/* ------------------------------------------------------------------ */
+
+/** Push the stored volume into the audio layer, ignoring an unusable value. */
+static void voice_apply_configured_volume(void)
+{
+    char *end = NULL;
+    long percent;
+
+    if (!s_voice.config.voice_volume[0]) {
+        return;
+    }
+    percent = strtol(s_voice.config.voice_volume, &end, 10);
+    if (end == s_voice.config.voice_volume || *end != '\0' ||
+        voice_audio_io_set_volume((int)percent) != ESP_OK) {
+        ESP_LOGW(TAG, "Ignoring out-of-range voice_volume '%s'; staying at %d%%",
+                 s_voice.config.voice_volume, voice_audio_io_get_volume());
+        return;
+    }
+    ESP_LOGI(TAG, "Playback volume set to %d%%", (int)percent);
+}
+
+/**
+ * @brief Change the volume and make it survive a reboot.
+ *
+ * The stored config is reloaded rather than written from the owned copy: that
+ * copy is a snapshot from boot, so saving it wholesale would revert anything
+ * changed through the web UI in the meantime.
+ */
+static esp_err_t voice_set_volume_persisted(int percent)
+{
+    app_config_t stored;
+    esp_err_t err = voice_audio_io_set_volume(percent);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    snprintf(s_voice.config.voice_volume, sizeof(s_voice.config.voice_volume), "%d", percent);
+
+    if (app_config_load(&stored) != ESP_OK) {
+        ESP_LOGW(TAG, "Volume applied but not persisted: config load failed");
+        return ESP_OK;
+    }
+    snprintf(stored.voice_volume, sizeof(stored.voice_volume), "%d", percent);
+    if (app_config_save(&stored) != ESP_OK) {
+        ESP_LOGW(TAG, "Volume applied but not persisted: config save failed");
+    }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* Outbound agent reply -> TTS                                         */
 /* ------------------------------------------------------------------ */
 
@@ -437,6 +488,47 @@ static esp_err_t cap_voice_execute_speak(const char *input_json, const claw_cap_
     return ESP_OK;
 }
 
+static esp_err_t cap_voice_execute_set_volume(const char *input_json,
+                                              const claw_cap_call_context_t *ctx, char *output,
+                                              size_t output_size)
+{
+    cJSON *root;
+    cJSON *percent_item;
+    esp_err_t err;
+
+    (void)ctx;
+
+    if (!s_voice.initialized) {
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"voice pipeline not started\"}");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    root = input_json ? cJSON_Parse(input_json) : NULL;
+    if (!root) {
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"invalid JSON input\"}");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    percent_item = cJSON_GetObjectItem(root, "percent");
+    if (!cJSON_IsNumber(percent_item)) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"missing numeric 'percent'\"}");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = voice_set_volume_persisted((int)percent_item->valuedouble);
+    cJSON_Delete(root);
+
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "{\"ok\":false,\"error\":\"percent must be 0..%d\"}",
+                 VOICE_VOLUME_MAX);
+        return err;
+    }
+
+    snprintf(output, output_size, "{\"ok\":true,\"volume\":%d}", voice_audio_io_get_volume());
+    return ESP_OK;
+}
+
 static esp_err_t cap_voice_execute_display_text(const char *input_json,
                                                const claw_cap_call_context_t *ctx, char *output,
                                                size_t output_size)
@@ -510,6 +602,21 @@ static const claw_cap_descriptor_t s_voice_descriptors[] = {
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\","
                              "\"description\":\"Text to speak aloud.\"}},\"required\":[\"text\"]}",
         .execute = cap_voice_execute_speak,
+    },
+    {
+        .id = "voice_set_volume",
+        .name = "voice_set_volume",
+        .family = "voice",
+        .description = "Set the speaker volume for spoken replies, 0 (silent) to 100 (loudest). "
+                       "The setting is applied immediately and persists across reboots. This is "
+                       "the only way to change volume on this device; the audio Lua module's "
+                       "set_volume has no effect and disables the speaker until reboot.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{\"percent\":{\"type\":\"integer\",\"minimum\":0,"
+            "\"maximum\":100,\"description\":\"Volume percentage.\"}},\"required\":[\"percent\"]}",
+        .execute = cap_voice_execute_set_volume,
     },
 };
 
@@ -590,6 +697,8 @@ esp_err_t cap_voice_pipeline_init(const app_config_t *config)
     /* Own a copy: main.c frees the app_config_t it hands us at the end of
      * app_main, so every later credential read would hit freed memory. */
     memcpy(&s_voice.config, config, sizeof(s_voice.config));
+
+    voice_apply_configured_volume();
 
     /* Optional: a board without the panel just runs without status output, and
      * without advertising display_text to the agent. */

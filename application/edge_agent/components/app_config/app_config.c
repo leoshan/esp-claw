@@ -71,6 +71,7 @@ typedef struct {
 #define APP_DEFAULT_TTS_RESOURCE_ID          "seed-tts-2.0"
 #define APP_DEFAULT_TTS_SPEAKER              "zh_female_vv_uranus_bigtts"
 #define APP_DEFAULT_TTS_BASE_URL             "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+#define APP_DEFAULT_VOICE_VOLUME             "100"
 
 static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(wifi_ssid, "wifi_ssid", APP_WIFI_SSID),
@@ -120,6 +121,7 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(tts_resource_id, "tts_v3_res", APP_DEFAULT_TTS_RESOURCE_ID),
     APP_CONFIG_FIELD(tts_speaker, "tts_speaker", APP_DEFAULT_TTS_SPEAKER),
     APP_CONFIG_FIELD(tts_base_url, "tts_v3_url", APP_DEFAULT_TTS_BASE_URL),
+    APP_CONFIG_FIELD(voice_volume, "voice_volume", APP_DEFAULT_VOICE_VOLUME),
 };
 
 // for backward compatibility, migrate from old settings to new settings

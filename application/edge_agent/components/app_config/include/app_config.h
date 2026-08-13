@@ -62,6 +62,9 @@ typedef struct {
     char tts_resource_id[64];
     char tts_speaker[64];
     char tts_base_url[APP_CONFIG_STR_LEN];
+    /* Playback volume, "0".."100". Applied in software: boards driving a
+     * bare class-D amplifier have no gain control to set. */
+    char voice_volume[8];
 } app_config_t;
 
 esp_err_t app_config_init(void);

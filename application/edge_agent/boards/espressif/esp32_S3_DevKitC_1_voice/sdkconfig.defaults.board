@@ -57,3 +57,10 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
 CONFIG_BT_NIMBLE_MAX_BONDS=4
 CONFIG_BT_NIMBLE_MAX_CCCDS=4
+
+# Controller activity slots: advertising, scanning, and each connection take
+# one. The project default of 2 covered advertising plus a single connection,
+# so adding a scan overran the table and the controller rejected the whole
+# scan with HCI 0x07 "memory capacity exceeded" (NimBLE rc=519). Four covers
+# advertising + scanning + the two connections. 828 bytes each.
+CONFIG_BT_CTRL_BLE_MAX_ACT=4

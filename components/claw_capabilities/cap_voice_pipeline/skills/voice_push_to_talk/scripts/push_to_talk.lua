@@ -19,7 +19,11 @@ local DEFAULT_GPIOS = { 0, 21 }
 -- Wire the button between the pin and GND. The driver enables the internal
 -- pull-up for an active-low button, so no external resistor is needed.
 local ACTIVE_LEVEL = 0
-local IDLE_LEVEL = 1
+-- button.get_key_level reports a logical pressed state, not the raw pin
+-- level: it returns 1 only when the pin matches active_level
+-- (button_gpio.c:42). A resting button therefore reads 0 whatever the wiring
+-- polarity is, and 1 at startup means the switch is stuck closed.
+local PRESSED_LEVEL = 1
 local POLL_INTERVAL_MS = 20
 
 -- Read the pin list from the caller so a different button needs a router rule
@@ -95,13 +99,12 @@ if #watched == 0 then
 end
 
 for _, b in ipairs(watched) do
-    -- An idle pin sits at 1, held there by the internal pull-up. A pin already
-    -- reading 0 is either wired to GND permanently or has a stuck switch, and
-    -- would look exactly like "the button does nothing", so it is worth a line.
-    -- A healthy pin says nothing.
-    if b.level ~= IDLE_LEVEL then
-        print(string.format("push_to_talk: GPIO %d reads %s at rest, expected %d -- check wiring",
-                            b.gpio, tostring(b.level), IDLE_LEVEL))
+    -- A button already reading as pressed before anyone touched it is shorted
+    -- to ground or has a stuck switch. Left alone it would start capturing
+    -- immediately and never stop. A healthy button says nothing here.
+    if b.level == PRESSED_LEVEL then
+        print("push_to_talk: GPIO " .. b.gpio ..
+              " already reads as pressed -- shorted to GND or a stuck switch")
     end
 end
 print("push_to_talk: hold GPIO " .. table.concat(

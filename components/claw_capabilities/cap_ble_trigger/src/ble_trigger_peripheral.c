@@ -7,12 +7,15 @@
 
 #if CONFIG_CLAW_CAP_BLE_TRIGGER_ENABLED
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "host/ble_sm.h"
+#include "host/ble_store.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
 
@@ -188,6 +191,60 @@ bool ble_trigger_peripheral_is_connected(void)
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
 }
 
+/**
+ * Answer a pairing request.
+ *
+ * NimBLE raises this and then waits for ble_sm_inject_io(); an unanswered
+ * request stalls the pairing until the peer gives up and drops the link with
+ * HCI 0x13 "remote user terminated", which reads on the phone as pairing
+ * simply failing.
+ *
+ * Nothing here needs an encrypted link -- the trigger characteristic carries
+ * no security flags -- so this accepts whatever the peer asks for rather than
+ * defending a secret. The action is logged because which one is negotiated
+ * depends on the phone, and that is otherwise invisible.
+ */
+static int ble_trigger_handle_passkey(struct ble_gap_passkey_params *params, uint16_t conn_handle)
+{
+    struct ble_sm_io io = {.action = params->action};
+    int rc;
+
+    switch (params->action) {
+    case BLE_SM_IOACT_NUMCMP:
+        /* Both sides show a number for the user to compare. This side has no
+         * display, and MITM protection is off, so confirming is all that is
+         * left; it is equivalent to Just Works. */
+        io.numcmp_accept = 1;
+        ESP_LOGI(TAG, "Pairing: confirming numeric comparison %06" PRIu32, params->numcmp);
+        break;
+
+    case BLE_SM_IOACT_DISP:
+        /* The peer wants a passkey this side is supposed to display. There is
+         * no screen, so the serial log is the display. */
+        io.passkey = params->numcmp;
+        ESP_LOGW(TAG, "Pairing: enter passkey %06" PRIu32 " on the phone", io.passkey);
+        break;
+
+    case BLE_SM_IOACT_NONE:
+        return 0;
+
+    default:
+        /* INPUT would need the passkey the phone shows typed in here, and OOB
+         * needs an out-of-band channel. Neither exists on this device. */
+        ESP_LOGE(TAG,
+                 "Pairing needs action %d, which this device cannot do. Connect without "
+                 "pairing instead: the trigger characteristic needs no encryption.",
+                 params->action);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    rc = ble_sm_inject_io(conn_handle, &io);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_sm_inject_io failed: rc=%d", rc);
+    }
+    return rc;
+}
+
 static int ble_trigger_gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -219,9 +276,33 @@ static int ble_trigger_gap_event(struct ble_gap_event *event, void *arg)
         (void)ble_trigger_peripheral_start_advertising();
         return 0;
 
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        return ble_trigger_handle_passkey(&event->passkey.params, event->passkey.conn_handle);
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        struct ble_gap_conn_desc desc;
+
+        /* The peer is pairing again while this side still holds a bond for it,
+         * which is what happens after the phone forgets the device or a
+         * previous attempt half-completed. Keeping the stale keys makes every
+         * later attempt fail; dropping them lets the retry succeed. */
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ESP_LOGW(TAG, "Peer is re-pairing; dropping the stale bond");
+            (void)ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.status == 0) {
+            ESP_LOGI(TAG, "Link encrypted");
+        } else {
+            ESP_LOGW(TAG, "Pairing failed: status=%d", event->enc_change.status);
+        }
+        return 0;
+
     case BLE_GAP_EVENT_SUBSCRIBE:
     case BLE_GAP_EVENT_MTU:
-    case BLE_GAP_EVENT_ENC_CHANGE:
         return 0;
 
     default:

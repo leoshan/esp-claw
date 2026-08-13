@@ -103,7 +103,7 @@ graph TB
 
 ## 3. 功能特性清单
 
-本分支共 31 个提交、约 3450 行新增代码。按功能域归类如下（✅ 已实测通过，⚠️ 有已知限制）。
+本分支共 46 个提交。按功能域归类如下（✅ 已实测通过，⚠️ 有已知限制，🚧 已实现但未经硬件验证）。
 
 ### 3.1 语音识别（ASR）
 
@@ -112,7 +112,9 @@ graph TB
 | 火山引擎 v3 流式识别集成 | ✅ | `wss://.../api/v3/sauc/bigmodel_nostream`，替代初版的 v1 REST 接口 |
 | 自定义二进制协议分帧 | ✅ | 大端序，header/sequence/payload-size 三段，四种消息类型 |
 | 末包负序号标记 | ✅ | 双缓冲始终留一块音频，确保末包携带真实音频而非空包 |
+| **独立采集任务 + 环形缓冲** | ✅ | 麦克风由专属任务持续读入 4 秒 PSRAM 环，网络再慢也不丢音频。取代了原先只覆盖握手期的预缓冲 |
 | 握手与采集并行 | ✅ | 抢救回握手期间约 800 ms 音频，按下即说不再丢开头 |
+| **抬起后排空积压** | ✅ | 松手只停麦克风，已采集未发送的音频继续送完，不再切掉每句最后一个词 |
 | 采集时长下限保护 | ✅ | <600 ms 判定为误触，不发末包、不等转写 |
 | 错误帧正确解析 | ✅ | `header \| error_code \| message_size \| message`，鉴权失败可诊断 |
 | 服务端响应日志 | ✅ | 完整打印 JSON，便于定位服务端问题 |
@@ -129,6 +131,7 @@ graph TB
 | 生产者/消费者解耦 | ✅ | 播放在独立任务，避免阻塞 HTTP 回调导致 DMA 饿死 |
 | **I2S 分块写入** | ✅ | 8 KB 一块，修复整段写入必然超时的缺陷 |
 | **Markdown 过滤** | ✅ | 设备侧清理 `**` / `` ` `` / `#` / 列表 / `[文字](链接)`，避免念成"星星你好星星" |
+| **软件音量控制** | ✅ | Q15 定点衰减，增益取 `(p/100)²`；本板功放无增益接口，这是唯一可行的音量控制 |
 | 播放互斥 | ✅ | Agent 回复与 `voice_speak` 工具调用不会在 I2S 上串音 |
 | TTS 任务队列 | ✅ | 回调只入队，不阻塞消息投递任务（原会阻塞最长 20 s） |
 | 成功码兼容 | ✅ | 同时接受 `0` 与线上实际返回的 `20000000` |
@@ -142,12 +145,16 @@ graph TB
 | 引脚冲突预检 | ✅ | `esp_gpio_is_reserved()` 预检并点名冲突引脚（IDF 的 I2S 只警告不报错） |
 | **Dummy codec 启动修复** | ✅ | `CONFIG_CODEC_DUMMY_SUPPORT=y`，消除 `audio_dac` 每次启动的三行报错 |
 | 引用计数正确性 | ✅ | `ref_handle` / `unref_handle` 配对，避免板卡 deinit 后留下悬空句柄 |
+| **I2S 通道自愈** | ✅ | 被其他组件 `i2s_channel_disable()` 关掉后，重新套用板卡配置并使能，不必重启 |
 
 ### 3.4 触发方式
 
 | 特性 | 状态 | 说明 |
 | --- | --- | --- |
 | **Push-to-talk（按住说话）** | ✅ | 板载 BOOT 键 GPIO 0，无需接线；松手即停，绕开 VAD |
+| **外接按钮** | ✅ | GPIO 21，两根线到 GND，驱动自动开内部上拉。引脚列表由 router 规则传入，换脚不用重编译 |
+| **BLE 手机触发** | ✅ | 自定义 GATT 服务，写 1 字节 `01`/`00`/`02`。任意 BLE 调试助手可用，等于"手机当按钮" |
+| **BLE HID 实体按钮** | 🚧 | 扫描 `0x1812` 并连接，输入报文非全零判为按住。**未经硬件验证** |
 | **IM `/listen` 指令** | ✅ | 飞书/微信等任意已绑定通道，router 规则实现，无需改 C 代码 |
 | 控制台调用 | ✅ | `cap call voice_listen {}` |
 | Agent 自主调用 | ✅ | `voice_listen` / `voice_stop_listening` / `voice_speak` 三个工具 |
@@ -212,6 +219,26 @@ graph TB
 
 > **说明**：上述三个第三方驱动**并非新增依赖**，而是原本就由包管理器下载的托管组件（`managed_components/` 在 .gitignore 中）。
 > 因为需要改造以适配 ESP-IDF 6.0，按官方规范迁入工程自有目录并提交，避免哈希校验冲突。
+
+### 3.10 蓝牙无线触发（`cap_ble_trigger`，约 1560 行）
+
+独立组件，与语音管线解耦：两路输入都汇到 `ble_trigger_report()`，再由工作任务调
+`voice_listen` / `voice_stop_listening`。
+
+| 特性 | 状态 | 说明 |
+| --- | --- | --- |
+| **触发 GATT 服务（外围角色）** | ✅ | 板子广播 `esp-claw-mic`，手机连入写 1 字节。**不加密标志，无需配对** |
+| 按住 / 单击两种语义 | ✅ | `01`/`00` 按住说话；`02` 单击切换，供只能发单次事件的客户端 |
+| **BLE HID 主机（中心角色）** | 🚧 | 扫描 `0x1812`、Just Works 绑定、密钥存 NVS |
+| 通用输入报文映射 | 🚧 | 不解析键值：非全零=按住，全零=松开。适配未知按钮 |
+| 回调解耦 | ✅ | GATT 写发生在 NimBLE 主机任务上，改为入队后由工作任务执行，不阻塞链路层 |
+| 边沿去重 | ✅ | HID 按键重复每秒几十次同样报文，只有状态跳变才入队 |
+| 未松开保护 | ✅ | 15 秒无松开自动停止，防止断连后麦克风常开 |
+| 扫描诊断 | ✅ | `ble_trigger_scan` 列出所有扫到的设备（MAC/RSSI/是否 HID），能区分"按钮不兼容"和"不在范围" |
+| 配对应答 | ✅ | 处理 `PASSKEY_ACTION` 与 `REPEAT_PAIRING`；无屏幕时把配对码打到串口 |
+| Wi-Fi 共存 | ✅ | 扫描为被动、50% 占空、仅按需触发；开机扫描延后 6 秒避开 Wi-Fi 关联 |
+| 自动重连实体按钮 | ⚠️ 未做 | 重启后按钮多在休眠不广播，需手动 `ble_trigger_scan` |
+| 指定连接目标 | ⚠️ 未做 | 连扫到的第一个 HID 设备，附近有键鼠可能连错 |
 
 ---
 
@@ -397,7 +424,8 @@ stateDiagram-v2
 
 | 方式 | 实现 | 说明 |
 | --- | --- | --- |
-| **按住说话** | `push_to_talk.lua` + `lua_module_button` | BOOT 键（GPIO 0），按下 `voice_listen`、松开 `voice_stop_listening`。**松手即停，绕开了做 VAD 的工程量** |
+| **按住说话** | `push_to_talk.lua` + `lua_module_button` | BOOT 键（GPIO 0）与外接按钮（GPIO 21），按下 `voice_listen`、松开 `voice_stop_listening`。**松手即停，绕开了做 VAD 的工程量** |
+| **BLE 无线触发** | `cap_ble_trigger` | 手机写 GATT 特征，或实体 BLE HID 按钮。详见第 8 节 |
 | IM 指令 | router 规则 `/listen` 前缀 | 飞书/微信等任意已绑定通道 |
 | 控制台 | `cap call voice_listen {}` | 调试用 |
 | Agent 自主 | LLM 工具调用 | `voice_listen` / `voice_speak` / `display_text` |
@@ -604,11 +632,348 @@ v1 → v3 迁移时若沿用 `asr_base_url` 等键名，**已存的值优先于�
 设备会拿 v1 的 `https://` 地址去喂 WebSocket 客户端（scheme 不对直接被拒）。
 正解：新键名加 `v3` 后缀，让旧值自然被忽略。
 
+### 6.7 音频通道所有权
+
+**㉖ 这块板子根本没有音量控制，而"调音量"会把喇叭弄哑**
+
+Agent 被要求调音量时，会去用 Lua 的 `audio` 模块 `output:set_volume(50)`。两个问题叠加：
+
+1. **调了也没用**：MAX98357A 是定增益功放没有控制接口，板卡 YAML 用 `chip: internal`
+   → dummy codec，其 `set_vol = NULL`（`dummy_codec.c:135`），板卡管理器也没装软件音量
+   handler，`esp_codec_dev_set_out_vol()` 直接返回 `NOT_SUPPORT`。
+2. **还会把喇叭弄哑**：板卡管理器**每个外设只有一个 `i2s_chan_handle_t`**。Lua 关闭
+   codec 设备时 `esp_codec_dev_close()` → `data_if->enable(false)` → `i2s_channel_disable()`
+   关掉的正是语音管线借用的那条通道。此后 `i2s_channel_write` 永远返回
+   `ESP_ERR_INVALID_STATE`（`i2s_common.c:1353`，"The channel is not enabled"），
+   **没有任何代码会重新使能它**，不重启就好不了。
+
+两处都要治：软件音量在 PCM 送进 DMA 前做衰减；写入遇到 `INVALID_STATE` 时先用
+`i2s_channel_get_info()` 确认是"通道被禁用"而非"另有传输在进行"（两者错误码相同），
+再重新套用板卡的 clk/slot 配置并使能。**重配置而非只 enable**，因为
+`esp_codec_dev_open()` 会把采样率改成对方要的值。
+
+**㉗ `sizeof` 作用在指针上**
+
+播放任务的暂存缓冲从栈数组改成堆分配（修栈溢出）时，`chunk > sizeof(stage)` 没同步改。
+`stage` 是 `uint8_t *`，`sizeof` 是 **4** 而不是 8192，于是每轮循环只搬 4 字节、
+加解锁一次、写 I2S 一次，24 kHz 下约 12000 次/秒。功能上还能出声，但极可能是断续的来源。
+
+### 6.8 采集与网络的耦合
+
+**㉘ 采集和发送共用一个任务 = 句子中间掉字**
+
+现象：说"声音调高到60%"，识别回来是"声，调高到60%"——**"音"没了**。
+
+老代码是 `读麦克风 → asr_send_frame → TLS 写 → 回来再读`。I2S RX DMA 只存
+6 描述符 × 240 帧 = **90 ms**，任何一次 TLS 写超过 90 ms，那段音频就被静默覆盖。
+从日志按"按住时长 vs 实际送出音频"能量化：
+
+| 说的话 | 按住 | 送出 | 丢失 |
+| --- | --- | --- | --- |
+| 那声音调低 | 3421 ms | 2000 ms | **42%** |
+| 声音…… | 2833 ms | 1200 ms | **58%** |
+
+最刺眼的一段：握手完成（82660）到预缓冲发完（84230）之间 **1570 ms 麦克风完全没人读**。
+
+正解：**独立高优先级任务持续把麦克风灌进 4 秒 PSRAM 环**，ASR 只管从环里取。
+握手预缓冲随之作废——它本来只是在一个点上打补丁。
+
+同时修掉了另一个截断：老代码在按键抬起瞬间 `break` 出流式循环，把"已采集但还没发出去"
+的音频直接丢掉，**每句话的最后一个词都被切掉**。现在抬起只停麦克风，继续排空积压。
+
+### 6.9 蓝牙
+
+**㉙ 扫描被拒：`rc=519`，两个不同的原因**
+
+`519 = 0x207 = BLE_HS_ERR_HCI_BASE(0x200) + 0x07`，HCI **"Memory Capacity Exceeded"**。
+踩了两次，原因不同：
+
+1. 传了 `filter_duplicates = 1`，但 `CONFIG_BT_CTRL_BLE_SCAN_DUPL` 没开，控制器没有
+   去重表 → 拒绝整个扫描。改为软件侧按地址去重。
+2. 改完还是 519。真因是 **`CONFIG_BT_CTRL_BLE_MAX_ACT=2`**——Kconfig 原文："BLE maximum
+   activities of bluetooth controller，both of connections, scan, sync and adv"，
+   默认 6，本工程压到了 2。广播占 1 个槽、连接占 1 个，扫描要第 3 个，超出。
+   调到 **4**（广播 + 扫描 + 两条连接），每槽 828 字节。
+
+**教训**：同一个错误码可以有完全不同的成因，第一个假设被证伪后要重新查，而不是打补丁。
+
+**㉚ 未处理 `PASSKEY_ACTION` 会让配对静默挂死**
+
+从手机系统蓝牙设置发起配对时，NimBLE 抛 `BLE_GAP_EVENT_PASSKEY_ACTION` 后**等待应用调
+`ble_sm_inject_io()`**。事件落到 `default: return 0` 就没人应答，配对一直挂着，直到手机
+放弃并断开，报 `reason=531`（`0x213` = HCI `0x13` "Remote User Terminated"）。
+
+顺带也补了 `REPEAT_PAIRING`：对端带着旧绑定重连时若不删除陈旧密钥并返回 `RETRY`，
+第二次配对必然失败。
+
+**注意**：触发特征本来就不需要加密，**用 BLE 调试助手直接连接、不配对是正常路径**。
+
+**㉛ 单击被边沿检测吞掉**
+
+`tap` 走 `ble_trigger_report(source, !listening)`，而后者对"是否按住"做边沿去重
+（为了挡 HID 按键重复）。录音到上限**自己结束时没人清那个标志**，于是下一次单击算出的值
+与标志相同 → 判为重复 → 丢弃，要等 15 秒超时清掉才恢复。日志里表现为三条
+`No release after 15000 ms` 和每次单击后一段死区。
+
+正解：单击不走边沿状态机，自己一条消息，由工作任务直接问
+`cap_voice_pipeline_is_listening()`——那才是唯一知道录音有没有在跑的东西。
+
+### 6.10 诊断代码本身也会骗人
+
+**㉜ `button.get_key_level()` 返回的不是引脚电平**
+
+为排查外接按钮加了"静息电平"检查，结果两个按钮都报 `reads 0 at rest, expected 1`，
+可其中一个明明工作正常。看源码 `button_gpio.c:42`：
+
+```c
+return level == gpio_btn->active_level ? 1 : 0;
+```
+
+它**已经按 `active_level` 归一化过了**——返回的是"按下与否"，松开恒为 0。
+更糟的是：接地坏的时候上拉把引脚拉到 1、`1 == 0` 为假 → 返回 0；接好之后同样返回 0，
+**坏的和好的打印一模一样**，这个检查从头到尾没提供过任何信息。
+
+改成反过来判断：只有开机就读作"已按下"才告警（短路到地/开关卡死），那才是真故障。
+
+**㉝ 能力描述超过 256 字节会被硬截断**
+
+`claw_cap.c:313` 对超长描述按字节硬切。`voice_set_volume` 写了 276 字节，正好把
+"别用 Lua audio 模块调音量"那句警告切掉了——**而那恰恰是这段描述存在的意义**。
+`display_text` 的 346 字节同理，被砍掉的是"中文和 emoji 显示为空白"。
+
+排查时这条截断警告还立了功：日志里只有 `display_text` 的警告、**没有 `voice_set_volume`
+的**，据此断定固件里根本没有那个工具（用户没烧录），而不是它坏了。
+
+**㉞ JSON 数字进 Lua 会变成浮点**
+
+router 规则传 `{"gpios": [0, 21]}`，`cap_lua_push_json_value` 用 `lua_pushnumber`，
+日志打成 `hold GPIO 0.0 or 21.0`。`luaL_checkinteger` 对整数值浮点能正常转换，
+所以**功能没坏，只是每条关于这个引脚的日志看起来都像另一个引脚**。用 `math.tointeger` 归一。
+
+### 6.11 记忆抽取阻塞回答
+
+**㉟ 每轮回答都在等一次与回答无关的 LLM 调用**
+
+实测五个请求，**每一次 `completion` 都恰好在 `auto_extract` 之后 1 毫秒**：
+
+| 请求 | 出识别文本 | 回答完成 | 耗时 | `auto_extract` 完成 |
+| --- | --- | --- | --- | --- |
+| 1000000 | 133008 | 235490 | **102.5 s** | 235489 |
+| 1000001 | 235894 | 239465 | 3.6 s | 239464 |
+| 1000002 | 239714 | 251565 | 11.9 s | 251564 |
+| 1000003 | 272981 | 296661 | **23.7 s** | 296660 |
+| 1000004 | 330442 | 335230 | 4.8 s | 335229 |
+
+根因在 `claw_memory_session.c:383`：
+
+```c
+ESP_LOGI(TAG, "stage note provider waiting request=%" PRIu32, request->request_id);
+if (!done_sem || xSemaphoreTake(done_sem, portMAX_DELAY) != pdTRUE) {
+```
+
+**`portMAX_DELAY`，无限等待。** 每轮对话跑两次 LLM——一次回答、一次记忆抽取——
+而回答必须等抽取跑完。抽取正常 3~12 秒，那就是每句话白等 3~12 秒。
+
+还有个反馈回路让它更糟：等不到回应就再点一次，每次点击新开一条 ASR 的 TLS 连接加 TTS
+播放，全挤在同一个 2.4 GHz 射频上（还跑着 BLE），**越点，在等的那个调用越慢**。
+第一次赶上这个叠加，等了 102 秒。
+
+**修复不是加个超时那么简单**：工作任务只负责调 LLM 拿 `llm_text`
+（`claw_memory_session.c:278-315`），真正的 `claw_memory_auto_extract_apply_result()`
+是在**等待方**调用的（第 369 行）。等待方一超时走人，这条记忆就永远存不进去、被 sweep 回收。
+正确做法是把 apply 挪进工作任务，让等待变成纯可选的加速路径。
+
+该模块属于 fork 的上游核心（`claw_memory`），**本分支未改动**，先记录在案。
+
 ---
 
-## 7. 配置指南
+## 7. 构建、烧录与调试
 
-### 7.1 板卡与构建
+### 7.1 加载 ESP-IDF 环境
+
+**每开一个新终端都要做一次**，否则 `idf.py` 不存在或用错版本：
+
+```bash
+export IDF_PATH='/Users/leoshan/.espressif/v6.0.2/esp-idf'
+. $IDF_PATH/export.sh
+cd /Users/leoshan/ai_coding/esp-project/esp-claw/application/edge_agent
+```
+
+### 7.2 什么时候需要全量编译
+
+**绝大多数情况都不需要**，`idf.py build` 增量即可。已验证的行为：
+
+| 改了什么 | 怎么做 | 为什么够 |
+| --- | --- | --- |
+| `.c` / `.h` | `idf.py build` | 常规增量 |
+| Lua 脚本 / `SKILL.md` / router 规则 | `idf.py build` | 暂存目标是 `add_custom_target(... ALL)` 且无 `DEPENDS`，**每次构建都 `rm -rf` 重新拷贝并重打包镜像** |
+| `sdkconfig` / `sdkconfig.defaults*` | `idf.py build` | 自动 reconfigure |
+| `CMakeLists.txt` / `Kconfig` | `idf.py build` | 自动 reconfigure |
+| 换开发板 | `idf.py bmgr -c ./boards -b <板名>` + `idf.py set-target esp32s3` | 重新生成板卡代码 |
+| 换 ESP-IDF 版本、增删 managed component | 这时才考虑 `fullclean` | 工具链/依赖树变了 |
+
+验证方法（改完 Lua 后直接查产物，不必烧录）：
+
+```bash
+strings build/system.bin | grep "push_to_talk: hold GPIO"
+```
+
+> ⚠️ **本工程要少碰 `idf.py fullclean`**：它无法从零 configure，`sdkconfig` 丢过一次，
+> 是从 `components/gen_bmgr_codes/sdkconfig.bmgr_board.old` 恢复的。遇到诡异构建问题
+> 优先重跑 `idf.py build` 或删单个组件的 obj。
+
+> ⚠️ **`sdkconfig` 优先级高于 `sdkconfig.defaults.board`**。板级默认只在生成新
+> `sdkconfig` 时起作用，已存在的值不会被覆盖。所以改配置要**两边都改**：
+> `sdkconfig`（当前生效）+ `sdkconfig.defaults.board`（防止将来重新生成时飘回去）。
+
+### 7.3 分区与烧录策略
+
+固件分四块，**按改了什么决定烧哪块**：
+
+| 分区 | 偏移 | 内容 | 什么时候要烧 |
+| --- | --- | --- | --- |
+| `edge_agent.bin` | `0x20000` | C 代码、`sdkconfig` 生效结果 | 改了 `.c`/`.h`/Kconfig |
+| `system.bin` | `0xa20000` | **Lua 脚本、SKILL.md、router 规则种子**（只读） | 改了 Lua / skill / `.recovery` |
+| `storage.bin` | `0xcaa000` | DATA 分区初始内容 | **几乎不需要，见下** |
+| bootloader / 分区表 | `0x0` / `0x9000` | — | 改了分区表或 bootloader 配置 |
+
+```bash
+# 只改了 C 代码
+idf.py -p /dev/cu.usbmodem11301 app-flash monitor
+
+# 改了 Lua / skill / router 规则（多数情况用这条）
+idf.py -p /dev/cu.usbmodem11301 app-flash system-flash monitor
+
+# 全量（第一次烧录、换分区表、或想把设备恢复出厂）
+idf.py -p /dev/cu.usbmodem11301 flash monitor
+
+# 只看日志，不烧录
+idf.py -p /dev/cu.usbmodem11301 monitor
+```
+
+> ⚠️ **全量 `flash` 会重写 `storage.bin`，清空 `/fatfs`**——会话历史、长期记忆、
+> 已配置的 router 规则全部丢失，开机从 `/system/.recovery/` 重新播种。启动日志里出现
+> `recovered /system/.recovery/... -> /fatfs/...` 就是发生了这件事。
+> **想保住设备数据就别烧 `storage-flash`。**
+>
+> 反过来说：`.recovery` 里的 router 规则改动**只在 DATA 缺失时才播种**，
+> 设备上已有旧文件不会被覆盖。要让新规则生效，要么全量烧一次，要么手动删掉设备上那个文件。
+
+### 7.4 确认烧的是不是新固件
+
+烧录后第一件事看这三行，任何一条对不上就是没烧进去：
+
+```
+I (873) app_init: Compile time:     Aug 13 2026 23:37:01     ← 与本地构建时间对得上吗
+I (879) app: ESP-Claw git version:  baseline-before-voice-port-44-gf61d8f24
+--- Warning: Checksum mismatch between flashed and built applications.   ← 出现这行 = 芯片里不是你刚构建的
+```
+
+最后那行是 `idf.py monitor` 自己比对 flash 内容与 `build/edge_agent.bin` 的结果，
+**是最直接的判据**。本项目已经因为"只跑了 `monitor` 没跑 `flash`"排查过两次假故障。
+
+### 7.5 串口调用 capability
+
+`esp_console` 的分词器会吃掉双引号并按空格切分，**JSON 必须转义**：
+
+```bash
+cap call voice_set_volume "{\"percent\":50}"
+cap call ble_trigger_scan "{\"seconds\":10}"
+cap call ble_trigger_status "{}"
+cap call memory_list "{}"
+```
+
+写成 `cap call voice_speak {"text":"hi"}` 会被处理成 `{text:hi}`，报 `invalid json`。
+
+---
+
+## 8. 蓝牙配对与连接
+
+ESP32-S3 **只有 BLE，没有经典蓝牙**（soc_caps 里只有 `SOC_BLE_SUPPORTED`），
+所以按钮必须是 BLE HID（HOGP），经典蓝牙的遥控器一律不行。
+
+### 8.1 手机作为按钮（已验证）
+
+板子作**外围**，手机 BLE 调试助手连进来。触发特征**不带加密标志，不需要配对**。
+
+1. 开机日志出现：
+   ```
+   I ble_trig_stack:  NimBLE up as 'esp-claw-mic', own address type 0
+   I ble_trig_periph: Advertising as 'esp-claw-mic'; write 0x01/0x00 to characteristic 7a3f1e01-...
+   ```
+2. 调试助手搜到 `esp-claw-mic`，**直接连接**（不要点"配对/绑定"）
+3. 找到服务 / 特征：
+
+   | | UUID |
+   | --- | --- |
+   | 服务 | `7a3f1e00-5c2b-4a9d-8e11-2f6b0c9d4a71` |
+   | 触发特征 | `7a3f1e01-5c2b-4a9d-8e11-2f6b0c9d4a71` |
+
+4. 写入**一个字节**（⚠️ 把输入格式切到 **HEX**，很多 app 默认发文本会被拒）：
+
+   | 写入 | 效果 |
+   | --- | --- |
+   | `01` | 按下 → 开始录音 |
+   | `00` | 松开 → 停止并转写 |
+   | `02` | 单击 → 切换（在录就停，没录就开）|
+
+   读该特征返回当前是否正在录音。
+
+成功时串口出现 `I cap_ble_trigger: [gatt] press -> voice_listen: ESP_OK`。
+
+> 从**手机系统蓝牙设置**发起配对会走另一套流程并要求输入配对码——那条路不需要，
+> 且配对码是给手机确认的，往串口敲没有意义。
+
+### 8.2 实体 BLE HID 按钮（未经硬件验证）
+
+板子作**中心**，主动连出去。
+
+1. **让按钮进入广播状态**——多数遥控器要长按某键进配对模式，或刚上电才广播。
+   这一步没做对后面全白搭。
+2. 触发扫描（开机后 6 秒也会自动扫 8 秒，但那时按钮多半还没就绪）：
+   ```bash
+   cap call ble_trigger_scan "{\"seconds\":10}"
+   ```
+   也可以直接对着麦克风说"启动蓝牙扫描"，Agent 会自己调这个工具（已实测）。
+3. 返回会列出**每个扫到的设备**，能区分"按钮不兼容"和"不在广播"：
+   ```json
+   {"ok":true,"hid_button_found":true,
+    "devices":"seen 5 device(s)\n  ff:ee:dd:cc:bb:aa rssi=-52 hid=yes name=Shutter"}
+   ```
+4. 连上后串口出现 `Opening HID button ...` → `HID button connected`，
+   按一下按钮应看到 `[hid] press -> voice_listen: ESP_OK`。
+
+**不需要输 PIN**：Just Works 配对（`sm_io_cap = NO_INPUT_OUTPUT`，`sm_mitm = 0`），
+密钥存 NVS（`BT_NIMBLE_NVS_PERSIST=y`，最多 4 个绑定），重启不用重新配对。
+
+### 8.3 选购与排错
+
+**买之前先验证按钮语义**：配到电脑上，打开文本编辑器长按。字符连续重复说明它分别上报了
+按下和抬起，能做"按住说话"；只出一个字符就只有"单击"语义，只能用切换模式。
+
+| 现象 | 原因 |
+| --- | --- |
+| 扫描报 `rc=519` | 控制器活动槽不足，见踩坑 ㉙ |
+| 扫到设备但 `hid=no` | 不是标准 HOGP 设备，走不了这条路 |
+| 扫不到按钮 | 按钮没进广播模式，或已被别的设备连着 |
+| 连错设备 | 连的是扫到的第一个 `0x1812`，附近键鼠会抢 |
+| 重启后不工作 | 不会自动重连，唤醒按钮后重新 `ble_trigger_scan` |
+
+### 8.4 关键 BLE 配置
+
+| 选项 | 值 | 为什么 |
+| --- | --- | --- |
+| `BT_NIMBLE_ROLE_CENTRAL` / `ROLE_OBSERVER` / `GATT_CLIENT` | **y** | 工程默认关闭，只有外围角色，连不出去 |
+| `BT_NIMBLE_HID_SERVICE` | **y** | 否则 esp_hid 的 `nimble_hidh.c` 编译成空文件 |
+| `BT_CTRL_BLE_MAX_ACT` | **4** | 广播 + 扫描 + 两条连接，每槽 828 字节 |
+| `BT_NIMBLE_MAX_CONNECTIONS` | **2** | 手机与按钮不互相挤掉 |
+| `CLAW_CAP_BLE_TRIGGER_HOLD_TIMEOUT_MS` | 15000 | 断连后麦克风不会常开 |
+
+---
+
+## 9. 配置指南
+
+### 9.1 板卡与构建
 
 ```bash
 export IDF_PATH='/Users/leoshan/.espressif/v6.0.2/esp-idf'
@@ -621,16 +986,23 @@ idf.py build
 idf.py -p /dev/cu.usbmodem11301 flash monitor
 ```
 
-### 7.2 接线
+### 9.2 接线
 
 | 器件 | 引脚 |
 | --- | --- |
 | INMP441 麦克风 | WS=4, SCK=5, DIN=6（I2S0, 16 kHz, 左声道） |
 | MAX98357A 功放 | BCLK=15, LRCK=16, DOUT=7（I2S1, 24 kHz） |
 | SSD1306 OLED | SDA=41, SCL=42（I2C, 0x3C 或 0x3D 自动探测） |
-| 按键 | BOOT 键 GPIO 0（板载，无需接线） |
+| 按键（板载） | BOOT 键 GPIO 0，无需接线 |
+| 按键（外接） | **GPIO 21 ↔ GND**，两根线，驱动自动开内部上拉，不需要电阻 |
 
-### 7.3 云端配置
+外接按钮选 GPIO 21 的理由：非 strapping 脚，且未被 flash（26-32）、**八线 PSRAM（33-37）**、
+USB（19-20）、UART0（43-44）或本板音频/I2C/LED 占用。同样空闲的还有
+1、2、8-14、17、18、39、40、47。
+
+⚠️ 四脚轻触开关**同一侧两脚是常通的**，要接对角线的两个脚。
+
+### 9.3 云端配置
 
 网页配置页 →「语音服务 (ASR / TTS)」，**只需填 1 个 API Key**：
 
@@ -643,7 +1015,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 | TTS 音色 | `zh_female_vv_uranus_bigtts` |
 | TTS 服务地址 | `https://openspeech.bytedance.com/api/v3/tts/unidirectional` |
 
-### 7.4 关键 Kconfig
+### 9.4 关键 Kconfig
 
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
@@ -652,10 +1024,12 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 | `CLAW_CAP_VOICE_RECORD_DURATION_SEC` | 8 | 单次采集上限（流式，不决定缓冲大小） |
 | `CONFIG_WS_BUFFER_SIZE` | **4096** | 默认 1024 不足以容纳 ASR 网关的响应头 |
 | `CONFIG_CODEC_DUMMY_SUPPORT` | **y** | MAX98357A 无控制接口，需 dummy codec |
+| `CLAW_CAP_BLE_TRIGGER_ENABLED` | n（本板卡 y） | 蓝牙无线触发，依赖语音管线 |
+| `voice_volume`（NVS，非 Kconfig） | 100 | 软件音量 0-100，网页配置页可改，`voice_set_volume` 可改 |
 
 ---
 
-## 8. 性能实测
+## 10. 性能实测
 
 | 指标 | 数值 |
 | --- | --- |
@@ -676,14 +1050,18 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 
 ---
 
-## 9. 已知限制与后续工作
+## 11. 已知限制与后续工作
 
 | 项 | 说明 |
 | --- | --- |
 | **无唤醒词** | 需引入 ESP-SR / WakeNet：模型占 flash、麦克风需常开、CPU 与内存开销显著 |
 | **屏幕只支持 ASCII** | 5×7 字库无中文无 emoji，`display_text` 描述里已声明。中文需要点阵字库 + 更大的 flash 占用 |
 | **蓝牙麦克风不可行** | ESP32-S3 **只有 BLE，没有经典蓝牙**，而 A2DP/HFP 都依赖 BR/EDR。可行替代是 USB Audio Class（`usb_host_uac`，原板卡已声明过该依赖） |
-| **会话历史无限增长** | 实测三轮从 51 字节涨到 51471 字节（工具结果和文件内容都进历史），直接推高每轮 token 成本与延迟 |
+| **会话历史无限增长** | 实测三轮从 51 字节涨到 51471 字节（工具结果和文件内容都进历史），直接推高每轮 token 成本与延迟。且**每轮要完整发给 LLM 两次**（回答一次、记忆抽取一次） |
+| **记忆抽取阻塞回答** | `claw_memory_session.c:383` 用 `portMAX_DELAY` 等待抽取完成才发回复，实测每轮多等 3~12 秒，最坏一次 **102 秒**。详见踩坑 ㉟。属上游核心模块，本分支未改动 |
+| **BLE HID 按钮未经硬件验证** | 无实体按钮可测，手机也无法模拟 HID 外设（Android/iOS 保留 `0x1812`）。只保证编译通过与逻辑自洽 |
+| **BLE 不自动重连按钮** | 开机扫一次，按钮休眠时不广播多半扫不到，需手动 `ble_trigger_scan` |
+| **BLE 连第一个 HID 设备** | 无地址/名称过滤，附近有键鼠可能连错 |
 | **录音上限固定** | 按住说话已绕开该限制；若要做免按键，仍需设备侧 VAD |
 | **屏幕未纳入板卡管理器** | 目前由本组件直接驱动 I2C，`board_hardware_info` 查不到它。已用 capability 弥补，但 Lua 的 `display`/`lcd` 模块仍无法使用它 |
 
@@ -691,7 +1069,7 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 
 ## 附：提交历史
 
-本分支共 31 个提交。按主题归类：
+本分支共 46 个提交。按主题归类：
 
 - **初版移植**（`723e6d59` … `dae7caf7`）：v1 接口 + 自建 I2S + 一串构建修复
 - **代码审查后重构**（`6aa6cce1`、`018cd4f5`、`ef392592`）：修复 TTS 解码、ASR 不可达、
@@ -700,3 +1078,10 @@ idf.py -p /dev/cu.usbmodem11301 flash monitor
 - **联调修复**（`3e9cf889` … `dd53a5d3`）：WS 缓冲、成功码、slot_mask、回复投递
 - **体验优化**（`87cf40a2` … `0d67c35c`）：缓冲播放、触发方式、markdown 清理、
   OLED 状态、预缓冲流式、握手期采集、能力可见性
+- **文档**（`90967d89`、`8b5bce71`、`719b2672`）：本设计文档、README 提示、功能清单
+- **音量与音频健壮性**（`53a9ce8b`、`8f72c1da`）：软件音量、I2S 通道自愈、
+  独立采集任务（修句中吞字）
+- **蓝牙无线触发**（`a73337ec`、`a413e35d`、`7b8a74cc`、`f61d8f24`）：`cap_ble_trigger`、
+  控制器活动槽、配对应答、单击去重
+- **按钮与打磨**（`2eb4c45f`、`6bf221af`、`359c3e27`、`88843eca`）：外接按钮、
+  8 秒采集上限、电平检查修正、能力描述长度

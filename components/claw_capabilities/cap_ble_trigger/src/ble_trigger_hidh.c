@@ -269,7 +269,12 @@ esp_err_t ble_trigger_hidh_scan(int duration_sec, char *out_report, size_t repor
     params.passive = 1;
     params.itvl = BLE_TRIGGER_SCAN_ITVL;
     params.window = BLE_TRIGGER_SCAN_WIN;
-    params.filter_duplicates = 1;
+    /* Deduplicating in the controller needs CONFIG_BT_CTRL_BLE_SCAN_DUPL, which
+     * costs a table of RAM and is off in this project. Asking for it anyway
+     * makes the controller reject the whole scan with HCI 0x07 "memory capacity
+     * exceeded" (NimBLE rc=519). ble_trigger_note_seen already deduplicates by
+     * address, so the only cost of leaving this off is repeat callbacks. */
+    params.filter_duplicates = 0;
 
     rc = ble_gap_disc(ble_trigger_stack_own_addr_type(), duration_sec * 1000, &params,
                       ble_trigger_disc_event, NULL);

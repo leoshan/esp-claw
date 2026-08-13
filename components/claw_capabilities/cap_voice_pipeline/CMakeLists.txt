@@ -9,6 +9,7 @@ idf_component_register(
         "src/volcengine_asr.c"
         "src/volcengine_tts.c"
         "src/voice_audio_io.c"
+        "src/voice_capture.c"
         "src/voice_status_display.c"
     INCLUDE_DIRS
         "include"
@@ -26,5 +27,6 @@ idf_component_register(
         driver
         esp_driver_i2s
         esp_driver_i2c
+        esp_ringbuf
         mbedtls
 )

@@ -99,6 +99,36 @@ int voice_audio_io_get_volume(void);
 /** @brief Attenuate @p sample_count 16-bit mono samples in place. */
 void voice_audio_io_apply_volume(int16_t *samples, size_t sample_count);
 
+/* Four seconds of audio. Sized from what a stalled consumer actually costs:
+ * the WebSocket handshake plus the first burst of sends left the microphone
+ * unread for over 1.5 s on hardware, and anything not buffered in that window
+ * is speech the recognizer never sees. */
+#define VOICE_CAPTURE_RING_BYTES (VOICE_ASR_SAMPLE_RATE * 2 * 4)
+
+/**
+ * @brief Start draining the microphone into a ring buffer on its own task.
+ *
+ * Decouples capture from whatever consumes it. The I2S DMA holds about 90 ms,
+ * so any consumer that pauses longer than that -- a TLS write, a handshake --
+ * loses audio unless something else is reading meanwhile.
+ */
+esp_err_t voice_capture_start(void);
+
+/** @brief Stop the reader and wait for it to leave the I2S channel. */
+void voice_capture_stop(void);
+
+/**
+ * @brief Copy up to @p max_bytes of captured audio out of the ring.
+ *
+ * @param timeout_ms How long to wait for the first bytes; later bytes already
+ *                   buffered are taken without waiting.
+ * @return Bytes copied, 0 if none arrived within the timeout.
+ */
+size_t voice_capture_read(void *dest, size_t max_bytes, uint32_t timeout_ms);
+
+/** @brief Discard buffered audio, so a new utterance does not inherit it. */
+void voice_capture_flush(void);
+
 /**
  * @brief Pull one utterance through the streaming ASR service.
  *

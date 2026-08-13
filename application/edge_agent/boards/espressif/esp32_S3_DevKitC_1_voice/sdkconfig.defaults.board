@@ -27,6 +27,11 @@ CONFIG_CODEC_DUMMY_SUPPORT=y
 # Voice pipeline: ASR/TTS over the board-managed I2S mic and speaker
 CONFIG_CLAW_CAP_VOICE_PIPELINE_ENABLED=y
 
+# Holding a button ends the utterance on release, so this only bounds it. The
+# BLE tap trigger has no release, though, and relies on this cap alone -- at
+# 4 s it cut off anything longer than a short question.
+CONFIG_CLAW_CAP_VOICE_RECORD_DURATION_SEC=8
+
 # transport_ws uses this one buffer for BOTH the WebSocket upgrade request and
 # the handshake response headers. The default 1024 is too small for the
 # Volcengine ASR endpoint: its gateway returns enough tracing headers that the

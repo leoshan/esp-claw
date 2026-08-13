@@ -97,9 +97,12 @@ end
 for _, b in ipairs(watched) do
     -- An idle pin sits at 1, held there by the internal pull-up. A pin already
     -- reading 0 is either wired to GND permanently or has a stuck switch, and
-    -- would look exactly like "the button does nothing".
-    print(string.format("push_to_talk: GPIO %d idle level %s%s", b.gpio, tostring(b.level),
-                        b.level == IDLE_LEVEL and "" or "  <-- expected " .. IDLE_LEVEL))
+    -- would look exactly like "the button does nothing", so it is worth a line.
+    -- A healthy pin says nothing.
+    if b.level ~= IDLE_LEVEL then
+        print(string.format("push_to_talk: GPIO %d reads %s at rest, expected %d -- check wiring",
+                            b.gpio, tostring(b.level), IDLE_LEVEL))
+    end
 end
 print("push_to_talk: hold GPIO " .. table.concat(
     (function()
@@ -111,19 +114,5 @@ print("push_to_talk: hold GPIO " .. table.concat(
 -- One queue serves every handle, so a single dispatch loop covers them all.
 while true do
     button.dispatch()
-
-    -- Report raw pin transitions alongside the button events they should
-    -- produce. A transition with no "pressed" line means the button library
-    -- rejected it; no transition at all means the press never reached the pin,
-    -- which is wiring rather than software.
-    for _, b in ipairs(watched) do
-        local level = button.get_key_level(b.handle)
-
-        if level ~= b.level then
-            b.level = level
-            print("push_to_talk: GPIO " .. b.gpio .. " level -> " .. tostring(level))
-        end
-    end
-
     delay.delay_ms(POLL_INTERVAL_MS)
 end

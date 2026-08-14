@@ -4,7 +4,13 @@ tmp/
 releases/
 
 # ESP-IDF
+# sdkconfig is generated, but it is also the only record of which board the
+# firmware was configured for. Losing it once silently swapped the build from
+# esp32_S3_DevKitC_1_voice/16MB back to esp32_S3_DevKitC_1/8MB, and nothing in
+# git could show that it had happened. Track the one the project actually
+# builds; keep any generated later (test_apps and friends) out.
 sdkconfig
+!/application/edge_agent/sdkconfig
 sdkconfig.old
 sdkconfig.priv
 sdkconfig.bmgr_board.old

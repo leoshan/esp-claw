@@ -14,7 +14,13 @@ sdkconfig
 sdkconfig.old
 sdkconfig.priv
 sdkconfig.bmgr_board.old
+# The component manager resolves this once and then carries it forward. A
+# re-solve is not reproducible: two dependency rules in lua_module_vision key
+# off Kconfig symbols that do not exist on a board without a camera, so solving
+# from scratch never converges and the project stops building. Losing this file
+# cost a working build, and nothing in git could put it back.
 dependencies.lock
+!/application/edge_agent/dependencies.lock
 managed_components/
 
 # IDE / Editor

@@ -785,6 +785,64 @@ if (!done_sem || xSemaphoreTake(done_sem, portMAX_DELAY) != pdTRUE) {
 
 该模块属于 fork 的上游核心（`claw_memory`），**本分支未改动**，先记录在案。
 
+### 6.12 依赖求解不收敛
+
+**㊱ 一个无摄像头的板卡让整个工程构建不起来**
+
+`idf.py build` 突然报：
+
+```
+CMake Error at .../project.cmake:789 (message):
+  Missing required kconfig option after retry.
+```
+
+`lua_module_vision/idf_component.yml` 有两条条件依赖：
+
+```yaml
+espressif/esp-dl:
+  rules:
+    - if: $CONFIG{LUA_MODULE_VISION_ESPDET} == True
+espressif/color_detect:
+  rules:
+    - if: $CONFIG{LUA_MODULE_VISION_COLOR_DETECT} == True
+```
+
+这两个符号所在的 Kconfig menu 有 `depends on ESP_BOARD_DEV_CAMERA_SUPPORT`，而
+**被 depends 关掉的符号根本不会被写进 sdkconfig**（confgen 自己的提示原话：
+"Disabled symbols/choices are not written into sdkconfig file"）。于是在无摄像头的板卡上，
+manifest 引用了一个不存在的符号，组件管理器每次求解都要求重跑一次，而 IDF 只重试一次
+（`project.cmake:785-789`），第二次仍然如此就致命退出。
+
+**这个问题一直潜伏着**：`dependencies.lock` 保存着一份早已求解好的结果，只要没人让它
+失效就永远不会重新求解。一旦有什么（换板卡、改直接依赖）动了它，这个雷就炸。
+
+排查时踩的第二个坑：我为了"从干净状态重来"**删掉了 `dependencies.lock`**——而它恰恰是
+唯一让这个工程还能构建的东西，且不在 git 里、无法恢复。把一个还能凑合的状态变成了必须
+立刻解决的故障。最后是临时去掉那两条规则让求解通过，再永久删除它们（本板卡永远不可能
+启用这两个依赖），并把 `dependencies.lock` 纳入版本控制（见 7.3）。
+
+**教训**：定位问题时"清空重来"这个动作，对**不可重新生成**的文件是破坏性的。删之前先问
+一句：这东西没了还能长回来吗。
+
+**㊲ MCP 客户端在发出任何字节之前就失败**
+
+`mcp_list_tools` / `mcp_call_tool` 无论换端点还是换参数都秒失败，错误码一模一样：
+
+```
+E esp_mcp_mgr: esp_mcp_mgr_post_req(950): MCP instance not configured
+I claw_core: tool_result name=mcp_list_tools err=ESP_ERR_INVALID_STATE
+```
+
+`esp_mcp_mgr.c:948-950` 要求 `config.instance` 指向一个 `esp_mcp_create()` 出来的引擎，
+而 `cap_mcp_client` 从来没设过它。全树唯一的 `esp_mcp_create()` 在 `cap_mcp_server.c:107`,
+**edge_agent 根本不启动那个 server**。所以工具注册了、也对模型可见，却是死的。
+
+修法是让客户端**每次请求创建自己的私有引擎**，不再依赖 server cap 启动；per-request 也让
+不同服务器之间的握手状态（`initialize` / `notifications/initialized` / session id）不会串。
+
+顺带：`mcp_discover` 走 mDNS，只能发现同一局域网内的服务，**对公网 MCP 服务器永远返回
+"(no mcp servers discovered)"**，这是预期行为而非故障。
+
 ---
 
 ## 7. 构建、烧录与调试
@@ -826,7 +884,39 @@ strings build/system.bin | grep "push_to_talk: hold GPIO"
 > `sdkconfig` 时起作用，已存在的值不会被覆盖。所以改配置要**两边都改**：
 > `sdkconfig`（当前生效）+ `sdkconfig.defaults.board`（防止将来重新生成时飘回去）。
 
-### 7.3 分区与烧录策略
+### 7.3 两个生成文件已纳入版本控制
+
+`sdkconfig` 和 `dependencies.lock` 原本都在 `.gitignore` 里。它们确实是生成文件，但
+**同时也是"当前构建到底是什么"的唯一记录**，而且都不可重新生成：
+
+| 文件 | 为什么必须留档 |
+| --- | --- |
+| `application/edge_agent/sdkconfig` | 唯一记录固件是为哪块板卡配置的。它曾经**静默地**从 `esp32_S3_DevKitC_1_voice`/16MB 变回 `esp32_S3_DevKitC_1`/8MB，git 里查不出发生过这件事 |
+| `application/edge_agent/dependencies.lock` | 组件管理器只求解一次然后一直沿用。**从零重新求解在本板卡上不会收敛**（见踩坑 ㊱），删掉就再也生成不回来 |
+
+现在两个文件都跟踪了，故障恢复各是一条命令：
+
+```bash
+git checkout -- application/edge_agent/sdkconfig          # 板卡被换掉 / 配置被冲掉
+git checkout -- application/edge_agent/dependencies.lock  # 依赖锁被重新求解后卡死
+```
+
+`.gitignore` 保留了通配忽略、只对 edge_agent 这两份放行，避免 `test_apps` 构建时生成的
+同名文件混进来：
+
+```gitignore
+sdkconfig
+!/application/edge_agent/sdkconfig
+...
+dependencies.lock
+!/application/edge_agent/dependencies.lock
+```
+
+> ⚠️ **代价是 `git status` 会变吵**：`idf.py bmgr`、`menuconfig`、组件管理器的定期重新
+> 检查都会改动它们。提交前扫一眼 diff——尤其 `CONFIG_ESP_BOARD_NAME` 和
+> `CONFIG_ESPTOOLPY_FLASHSIZE` 这两行，它们变了基本就意味着板卡被换了。
+
+### 7.4 分区与烧录策略
 
 固件分四块，**按改了什么决定烧哪块**：
 
@@ -859,7 +949,7 @@ idf.py -p /dev/cu.usbmodem11301 monitor
 > 反过来说：`.recovery` 里的 router 规则改动**只在 DATA 缺失时才播种**，
 > 设备上已有旧文件不会被覆盖。要让新规则生效，要么全量烧一次，要么手动删掉设备上那个文件。
 
-### 7.4 确认烧的是不是新固件
+### 7.5 确认烧的是不是新固件
 
 烧录后第一件事看这三行，任何一条对不上就是没烧进去：
 
@@ -872,7 +962,7 @@ I (879) app: ESP-Claw git version:  baseline-before-voice-port-44-gf61d8f24
 最后那行是 `idf.py monitor` 自己比对 flash 内容与 `build/edge_agent.bin` 的结果，
 **是最直接的判据**。本项目已经因为"只跑了 `monitor` 没跑 `flash`"排查过两次假故障。
 
-### 7.5 串口调用 capability
+### 7.6 串口调用 capability
 
 `esp_console` 的分词器会吃掉双引号并按空格切分，**JSON 必须转义**：
 
@@ -1085,3 +1175,7 @@ USB（19-20）、UART0（43-44）或本板音频/I2C/LED 占用。同样空闲�
   控制器活动槽、配对应答、单击去重
 - **按钮与打磨**（`2eb4c45f`、`6bf221af`、`359c3e27`、`88843eca`）：外接按钮、
   8 秒采集上限、电平检查修正、能力描述长度
+- **通道隔离与缓冲**（`b644051e`）：只朗读语音通道的回复、TTS 缓冲回收已播放部分、
+  分配失败闩锁，以及让依赖求解收敛的 manifest 修正
+- **MCP 客户端**（`1e5f1c62`，摘自 `fix/mcp-client-instance`）：客户端自建 MCP 引擎实例
+- **构建可复现**（`5f3ee785`、`c8ef00c8`）：`sdkconfig` 与 `dependencies.lock` 纳入版本控制

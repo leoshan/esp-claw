@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "esp_http_client.h"
+#include "esp_mcp_engine.h"
 #include "esp_mcp_mgr.h"
 
 #include "cap_mcp_client_priv.h"
@@ -17,6 +18,19 @@ typedef struct {
     cJSON *result;
     esp_err_t err;
 } cap_mcp_response_ctx_t;
+
+/**
+ * @brief One outbound MCP client session: the transport manager plus the engine it drives.
+ *
+ * The manager only carries protocol state; the engine instance (`esp_mcp_t`) holds the
+ * client-side session state (`initialize` handshake, `notifications/initialized`, session id).
+ * Both are owned by the session and are created/destroyed per request, so two calls against
+ * different servers never share handshake state.
+ */
+typedef struct {
+    esp_mcp_mgr_handle_t mgr;
+    esp_mcp_t *engine;
+} cap_mcp_session_t;
 
 static esp_err_t cap_mcp_parse_common_input(const char *input_json,
                                             char *server_url_buf,
@@ -162,9 +176,25 @@ static esp_err_t cap_mcp_init_remote_session(esp_mcp_mgr_handle_t mgr, const cha
     return err;
 }
 
-static esp_err_t cap_mcp_mgr_create(const char *server_url,
-                                    const char *endpoint,
-                                    esp_mcp_mgr_handle_t *mgr_out)
+static void cap_mcp_session_close(cap_mcp_session_t *session)
+{
+    if (!session) {
+        return;
+    }
+    if (session->mgr != 0) {
+        esp_mcp_mgr_stop(session->mgr);
+        esp_mcp_mgr_deinit(session->mgr);
+        session->mgr = 0;
+    }
+    if (session->engine) {
+        esp_mcp_destroy(session->engine);
+        session->engine = NULL;
+    }
+}
+
+static esp_err_t cap_mcp_session_open(const char *server_url,
+                                      const char *endpoint,
+                                      cap_mcp_session_t *session)
 {
     esp_err_t err;
     esp_http_client_config_t http_config = {
@@ -178,46 +208,37 @@ static esp_err_t cap_mcp_mgr_create(const char *server_url,
         .config = &http_config,
     };
 
-    if (!server_url || !server_url[0] || !endpoint || !endpoint[0] || !mgr_out) {
+    if (!server_url || !server_url[0] || !endpoint || !endpoint[0] || !session) {
         return ESP_ERR_INVALID_ARG;
     }
-    *mgr_out = 0;
+    session->mgr = 0;
+    session->engine = NULL;
 
-    err = esp_mcp_mgr_init(mgr_config, mgr_out);
+    /* The manager rejects every request with ESP_ERR_INVALID_STATE unless an engine instance is
+     * attached, so the client cap owns a private one instead of relying on cap_mcp_server. */
+    err = esp_mcp_create(&session->engine);
     if (err != ESP_OK) {
         return err;
     }
+    mgr_config.instance = session->engine;
 
-    err = esp_mcp_mgr_start(*mgr_out);
+    err = esp_mcp_mgr_init(mgr_config, &session->mgr);
     if (err != ESP_OK) {
-        esp_mcp_mgr_deinit(*mgr_out);
-        *mgr_out = 0;
+        cap_mcp_session_close(session);
         return err;
     }
 
-    err = esp_mcp_mgr_register_endpoint(*mgr_out, endpoint, NULL);
-    if (err != ESP_OK) {
-        esp_mcp_mgr_stop(*mgr_out);
-        esp_mcp_mgr_deinit(*mgr_out);
-        *mgr_out = 0;
-        return err;
+    err = esp_mcp_mgr_start(session->mgr);
+    if (err == ESP_OK) {
+        err = esp_mcp_mgr_register_endpoint(session->mgr, endpoint, NULL);
     }
-
-    err = cap_mcp_init_remote_session(*mgr_out, endpoint);
+    if (err == ESP_OK) {
+        err = cap_mcp_init_remote_session(session->mgr, endpoint);
+    }
     if (err != ESP_OK) {
-        esp_mcp_mgr_stop(*mgr_out);
-        esp_mcp_mgr_deinit(*mgr_out);
-        *mgr_out = 0;
+        cap_mcp_session_close(session);
     }
     return err;
-}
-
-static void cap_mcp_mgr_destroy(esp_mcp_mgr_handle_t mgr)
-{
-    if (mgr != 0) {
-        esp_mcp_mgr_stop(mgr);
-        esp_mcp_mgr_deinit(mgr);
-    }
 }
 
 static esp_err_t cap_mcp_capture_result(cap_mcp_response_ctx_t *ctx, cJSON **result_out)
@@ -244,7 +265,7 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
     char server_url_buf[256];
     char endpoint_buf[64];
     char cursor_buf[128];
-    esp_mcp_mgr_handle_t mgr = 0;
+    cap_mcp_session_t session = {0};
     cap_mcp_response_ctx_t ctx = {0};
     esp_mcp_mgr_req_t req = {0};
     esp_err_t err;
@@ -268,7 +289,7 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
         return err;
     }
 
-    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, &mgr);
+    err = cap_mcp_session_open(server_url_buf, endpoint_buf, &session);
     if (err != ESP_OK) {
         return err;
     }
@@ -279,8 +300,8 @@ esp_err_t cap_mcp_list_remote_tools(const char *input_json, cJSON **result_out)
     req.u.list.cursor = cursor_buf[0] ? cursor_buf : NULL;
     req.u.list.limit = -1;
 
-    err = esp_mcp_mgr_post_tools_list(mgr, &req);
-    cap_mcp_mgr_destroy(mgr);
+    err = esp_mcp_mgr_post_tools_list(session.mgr, &req);
+    cap_mcp_session_close(&session);
     if (err == ESP_OK) {
         err = cap_mcp_capture_result(&ctx, result_out);
     }
@@ -295,7 +316,7 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
     char tool_name_buf[128];
     cJSON *arguments = NULL;
     char *arguments_json = NULL;
-    esp_mcp_mgr_handle_t mgr = 0;
+    cap_mcp_session_t session = {0};
     cap_mcp_response_ctx_t ctx = {0};
     esp_mcp_mgr_req_t req = {0};
     esp_err_t err;
@@ -326,7 +347,7 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
         return ESP_ERR_NO_MEM;
     }
 
-    err = cap_mcp_mgr_create(server_url_buf, endpoint_buf, &mgr);
+    err = cap_mcp_session_open(server_url_buf, endpoint_buf, &session);
     if (err != ESP_OK) {
         cJSON_free(arguments_json);
         return err;
@@ -338,8 +359,8 @@ esp_err_t cap_mcp_call_remote_tool(const char *input_json, cJSON **result_out)
     req.u.call.tool_name = tool_name_buf;
     req.u.call.args_json = arguments_json;
 
-    err = esp_mcp_mgr_post_tools_call(mgr, &req);
-    cap_mcp_mgr_destroy(mgr);
+    err = esp_mcp_mgr_post_tools_call(session.mgr, &req);
+    cap_mcp_session_close(&session);
     cJSON_free(arguments_json);
     if (err == ESP_OK) {
         err = cap_mcp_capture_result(&ctx, result_out);

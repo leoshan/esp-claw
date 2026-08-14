@@ -80,6 +80,10 @@ typedef struct {
     size_t len;
     size_t capacity;
     bool overflow;
+    /* Latches on the first allocation failure. The HTTP callback keeps
+     * delivering slices regardless, and without this every one of them logged
+     * the same line -- hundreds of them in one reply. */
+    bool alloc_failed;
     esp_err_t play_err;
     size_t total_pcm;
     /* Decoded audio. Grows on the HTTP side, drains on the player side. */
@@ -154,8 +158,29 @@ static esp_err_t tts_pcm_append(tts_stream_t *stream, const uint8_t *pcm, size_t
 
     xSemaphoreTake(stream->lock, portMAX_DELAY);
 
+    /* Reclaim what the speaker already played instead of growing past it.
+     * Without this the buffer holds the whole utterance: a long reply reached
+     * 1 MB, failed to double to 2 MB in PSRAM, and every later slice repeated
+     * the failure. Only the not-yet-played backlog actually has to be
+     * resident, which is bounded by the prefill, not by the reply length. */
+    if (stream->played > 0 && stream->pcm_len + len > stream->pcm_capacity) {
+        size_t pending = stream->pcm_len - stream->played;
+
+        if (pending > 0) {
+            memmove(stream->pcm, stream->pcm + stream->played, pending);
+        }
+        stream->pcm_len = pending;
+        stream->played = 0;
+    }
+
+    if (stream->alloc_failed) {
+        err = ESP_ERR_NO_MEM;
+        goto out;
+    }
+
     if (stream->pcm_len + len > TTS_PCM_MAX_BYTES) {
         ESP_LOGE(TAG, "Synthesized audio exceeds %d bytes; truncating", TTS_PCM_MAX_BYTES);
+        stream->alloc_failed = true;
         err = ESP_ERR_NO_MEM;
         goto out;
     }
@@ -186,7 +211,9 @@ static esp_err_t tts_pcm_append(tts_stream_t *stream, const uint8_t *pcm, size_t
         xSemaphoreTake(stream->lock, portMAX_DELAY);
 
         if (!grown) {
-            ESP_LOGE(TAG, "Failed to grow audio buffer to %u bytes", (unsigned)new_cap);
+            ESP_LOGE(TAG, "Failed to grow audio buffer to %u bytes; truncating the reply",
+                     (unsigned)new_cap);
+            stream->alloc_failed = true;
             err = ESP_ERR_NO_MEM;
             goto out;
         }
@@ -238,6 +265,11 @@ static void tts_player_task(void *arg)
                 chunk = TTS_WRITE_CHUNK_BYTES;
             }
             memcpy(stage, stream->pcm + stream->played, chunk);
+            /* Consumed as far as the buffer is concerned: the bytes are in
+             * `stage` now. Advancing here rather than after the write keeps
+             * this in step with the producer's compaction, which resets
+             * `played` as soon as the lock is free. */
+            stream->played += chunk;
         }
         done = stream->producer_done;
         xSemaphoreGive(stream->lock);
@@ -264,7 +296,6 @@ static void tts_player_task(void *arg)
             xSemaphoreGive(stream->lock);
             break;
         }
-        stream->played += chunk;
     }
 
     free(stage);

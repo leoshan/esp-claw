@@ -256,6 +256,19 @@ static esp_err_t on_agent_outbound_message_cb(const cap_im_local_message_t *mess
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Only speak replies to something that was actually asked out loud.
+     * cap_im_local delivers for every channel, so without this the web chat
+     * and the IM bridges get read aloud too -- and those answers are written
+     * to be read, not heard: a disk-usage table went out as a megabyte of
+     * speech nobody asked for. */
+    if (!message->channel || strcmp(message->channel, VOICE_CHANNEL) != 0 ||
+        !message->chat_id || strcmp(message->chat_id, VOICE_CHAT_ID) != 0) {
+        ESP_LOGD(TAG, "Not speaking channel=%s chat=%s",
+                 message->channel ? message->channel : "(none)",
+                 message->chat_id ? message->chat_id : "(none)");
+        return ESP_OK;
+    }
+
     /* Speak final agent replies only. The same delivery path also carries the
      * "working on it" acknowledgement (event_type "message") and a
      * notification per tool call (event_type "agent_stage"); reading those

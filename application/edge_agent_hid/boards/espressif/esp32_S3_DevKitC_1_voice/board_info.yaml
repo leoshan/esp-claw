@@ -1,0 +1,4 @@
+board: esp32_S3_DevKitC_1_voice
+chip: esp32s3
+description: "ESP32-S3-DevKitC-1 breadboard with INMP441 mic, MAX98357A speaker and 0.91in SSD1306 OLED"
+manufacturer: "ESPRESSIF"

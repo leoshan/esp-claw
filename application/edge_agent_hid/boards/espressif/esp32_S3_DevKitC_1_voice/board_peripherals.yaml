@@ -1,0 +1,86 @@
+version: 1.0.0
+# Peripherals Configuration
+#
+# Breadboard build: ESP32-S3-DevKitC-1 + INMP441 I2S microphone +
+# MAX98357A I2S class-D amplifier + 0.91in 128x32 SSD1306 OLED (I2C).
+#
+# Audio pin map is carried over from the xiaozhi-esp32 bread-compact-wifi
+# wiring, so existing breadboards do not need to be re-wired. There is no SPI
+# display on this build, which is what frees GPIO 4/5/6/7/15/16 for audio.
+
+peripherals:
+  # Onboard WS2812 RGB LED
+  - name: rmt_tx
+    type: rmt
+    role: tx
+    config:
+      gpio_num: 38
+      clk_src: RMT_CLK_SRC_DEFAULT
+      resolution_hz: 10000000
+      mem_block_symbols: 64
+      trans_queue_depth: 4
+      intr_priority: 1
+      flags:
+        invert_out: false
+        with_dma: true  # RMT peripheral can connect to DMA channel in esp32s3
+        io_loop_back: false
+        io_od_mode: false
+        allow_pd: false
+        init_level: false
+
+  # I2C bus for the 0.91in 128x32 SSD1306 OLED (address 0x3C).
+  # Drive it from Lua via the i2c driver's ssd1306 library.
+  - name: i2c_master
+    type: i2c
+    role: master
+    config:
+      port: 0
+      pins:
+        sda: 41
+        scl: 42
+
+  # INMP441 MEMS microphone (I2S0 STD RX)
+  - name: i2s_audio_in
+    type: i2s
+    role: master
+    format: std-in
+    config:
+      port: 0
+      sample_rate_hz: 16000
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_bit_width: I2S_SLOT_BIT_WIDTH_AUTO
+      slot_mode: I2S_SLOT_MODE_MONO
+      # LEFT, not BOTH: the INMP441 has L/R tied low so it drives the left
+      # slot only. With BOTH in mono mode the driver captures both slots, which
+      # doubles the byte rate and hands the recognizer an interleaved stream it
+      # cannot decode. Matches xiaozhi-esp32's no_audio_codec.cc for this wiring.
+      slot_mask: I2S_STD_SLOT_LEFT
+      ws_width: 16
+      pins:
+        mclk: -1
+        bclk: 5
+        ws: 4
+        dout: -1
+        din: 6
+
+  # MAX98357A speaker amplifier (I2S1 STD TX)
+  - name: i2s_audio_out
+    type: i2s
+    role: master
+    format: std-out
+    config:
+      port: 1
+      sample_rate_hz: 24000
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_bit_width: I2S_SLOT_BIT_WIDTH_AUTO
+      slot_mode: I2S_SLOT_MODE_MONO
+      slot_mask: I2S_STD_SLOT_BOTH
+      ws_width: 16
+      pins:
+        mclk: -1
+        bclk: 15
+        ws: 16
+        dout: 7
+        din: -1

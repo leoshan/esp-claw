@@ -64,6 +64,10 @@
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
 #include "cap_web_search.h"
 #endif
+#if CONFIG_APP_CLAW_CAP_PHONE_SCREEN
+#include "app_claw.h"
+#include "cap_phone_screen.h"
+#endif
 #include "claw_cap.h"
 #if CONFIG_APP_CLAW_CAP_MEMORY
 #include "claw_memory.h"
@@ -715,6 +719,16 @@ static esp_err_t app_cap_register_web_search(const app_claw_config_t *config,
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_PHONE_SCREEN
+static esp_err_t app_cap_register_phone_screen(const app_claw_config_t *config,
+                                               const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_phone_screen_register_group(app_claw_get_core);
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
 static esp_err_t app_cap_register_router_mgr(const app_claw_config_t *config,
                                              const app_claw_storage_paths_t *paths)
@@ -794,6 +808,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
     { "cap_web_search", "Web Search", "Register web search cap", true, app_cap_prepare_web_search, app_cap_register_web_search },
 #endif
+#if CONFIG_APP_CLAW_CAP_PHONE_SCREEN
+    { "cap_phone_screen", "Phone Screen", "Register phone screen (AirPlay) cap", true, NULL, app_cap_register_phone_screen },
+#endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", "Register router manager cap", true, NULL, app_cap_register_router_mgr },
 #endif
@@ -850,6 +867,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_CAP_WEB_SEARCH
     { "cap_web_search", "Web Search", false },
+#endif
+#if CONFIG_APP_CLAW_CAP_PHONE_SCREEN
+    { "cap_phone_screen", "Phone Screen", true },
 #endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", false },

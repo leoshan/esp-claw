@@ -171,6 +171,15 @@ menu "App Claw Config"
                 Enable the web search capability and keep app_claw's direct dependency
                 on cap_web_search.
 
+        config APP_CLAW_CAP_PHONE_SCREEN
+            bool "Enable phone screen capability (AirPlay receiver, GPL-3.0)"
+            default n
+            help
+                Make the board an AirPlay screen-mirroring receiver and forward the phone's
+                H.264 stream to a LAN relay (phone_relay/relay.py) that serves the latest
+                frame. Links GPL-3.0 code (ported from UxPlay): firmware built with this
+                option must be distributed under the GPL.
+
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"
             select APP_CLAW_CAP_EVENT_ROUTER

@@ -1,0 +1,34 @@
+menu "Phone screen (AirPlay receiver)"
+    depends on APP_CLAW_CAP_PHONE_SCREEN
+
+    config CAP_PHONE_SCREEN_RECEIVER_NAME
+        string "AirPlay receiver name"
+        default "ESP-Claw"
+        help
+            Name shown in the phone's Control Center -> Screen Mirroring list.
+
+    config CAP_PHONE_SCREEN_RELAY_HOST
+        string "Relay host (LAN IP of the machine running phone_relay/relay.py)"
+        default ""
+
+    config CAP_PHONE_SCREEN_RELAY_STREAM_PORT
+        int "Relay H.264 stream port (TCP)"
+        default 8091
+
+    config CAP_PHONE_SCREEN_RELAY_HTTP_PORT
+        int "Relay HTTP port (GET /frame.jpg)"
+        default 8090
+
+    config CAP_PHONE_SCREEN_WIDTH
+        int "Advertised display width (the phone may ignore it)"
+        default 480
+
+    config CAP_PHONE_SCREEN_HEIGHT
+        int "Advertised display height (the phone may ignore it)"
+        default 1040
+
+    config CAP_PHONE_SCREEN_MAX_FPS
+        int "Advertised max fps"
+        default 5
+        range 1 60
+endmenu

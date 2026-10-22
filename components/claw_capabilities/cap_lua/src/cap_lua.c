@@ -23,6 +23,8 @@
 
 static const char *TAG = "cap_lua";
 
+#define CAP_LUA_GET_JOB_MAX_WAIT_MS 60000  /* lua_get_async_job wait_ms upper bound */
+
 typedef struct cap_lua_exit_cleanup_node {
     cap_lua_exit_cleanup_fn_t cleanup_fn;
     struct cap_lua_exit_cleanup_node *next;
@@ -589,6 +591,7 @@ static esp_err_t cap_lua_get_async_job_execute(const char *input_json,
                                                size_t output_size)
 {
     cJSON *root = NULL;
+    cJSON *wait_item = NULL;
     const char *job_id = NULL;
     esp_err_t err;
 
@@ -608,6 +611,20 @@ static esp_err_t cap_lua_get_async_job_execute(const char *input_json,
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: provide either 'job_id' or 'name'");
         return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Optional wait: block until the job ends (or wait_ms passes) so an agent polling a long job
+     * spends one tool call per minute instead of one every few seconds (it used to hit the tool
+     * iteration limit before a 10-minute job finished). */
+    wait_item = cJSON_GetObjectItem(root, "wait_ms");
+    if (cJSON_IsNumber(wait_item) && wait_item->valuedouble > 0) {
+        cap_lua_job_status_t status;
+        uint32_t wait_ms = wait_item->valuedouble > CAP_LUA_GET_JOB_MAX_WAIT_MS ?
+                           CAP_LUA_GET_JOB_MAX_WAIT_MS : (uint32_t)wait_item->valuedouble;
+        err = cap_lua_async_wait_settle(job_id, wait_ms, &status, NULL, 0);
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "get_async_job: wait for %s failed: %s", job_id, esp_err_to_name(err));
+        }
     }
 
     err = cap_lua_async_get_job(job_id, output, output_size);
@@ -730,11 +747,14 @@ static const claw_cap_descriptor_t s_lua_descriptors[] = {
         .id = "lua_get_async_job",
         .name = "lua_get_async_job",
         .family = "automation",
-        .description = "Get status, summary, and recent logs for a Lua async job by job_id or name.",
+        .description = "Get status, summary, and recent logs for a Lua async job by job_id or name. "
+        "Optional wait_ms (max 60000) first waits until the job ends or wait_ms passes: poll long "
+        "jobs with wait_ms=60000 instead of calling this repeatedly.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}}}",
+        "{\"type\":\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
+        "\"wait_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":60000}}}",
         .execute = cap_lua_get_async_job_execute,
     },
     {

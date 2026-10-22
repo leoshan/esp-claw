@@ -8,6 +8,7 @@ local capability = require("capability")
 local delay = require("delay")
 local json = require("json")
 local storage = require("storage")
+local system = require("system")
 
 local STEP = 10            -- max mouse units per report while moving
 local STEP_MS = 12         -- report interval
@@ -28,6 +29,10 @@ local MAX_CORRECTIONS = 4
 -- 150 was tuned for Home Screen "snap to item" highlights; with snapping off the readings are
 -- right and real open-loop misses reach ~200 (pointer acceleration), so only absurd ones go
 local MAX_AIM_ERROR = 400
+-- a rough reading (no moved-pointer lobes found: e.g. the pointer sits on a button and the button's
+-- hover highlight drowns it) is only trusted this close to the target; the AssistiveTouch button
+-- once gave a rough reading 455 units off
+local ROUGH_MAX_ERROR = 150
 local MAX_POINTER_BOX = 200  -- a diff bbox wider/taller than this is not just the pointer
 -- iOS sends a new mirrored frame only when the screen changes (an idle screen can go 2 s without
 -- one), so give the wiggled pointer up to ~2.5 s to show up in the diff
@@ -42,6 +47,17 @@ local CORRECTION_GAIN = 0.6  -- damp corrections: with 0.85 small corrections ov
 -- into "still" before the action's frames had even arrived.
 local STILL_POLLS = 5      -- up to ~8 s
 local STILL_MS = 1600
+-- With the relay's /still (how long the screen has not changed) a wait ends as soon as the screen
+-- has been quiet for QUIET_MS AND the last input is old enough for its frames to have arrived:
+-- ~0.7 s for a pointer move, up to ~1.6 s for a tap/type/swipe and the UI's answer. The fixed
+-- mark/sleep/diff window above cost ~3.5 s per wait (46% of a step) and is now only the fallback.
+local QUIET_MS = 1000
+local POINTER_LATENCY_MS = 700
+local INPUT_LATENCY_MS = STILL_MS
+local STILL_TIMEOUT_MS = STILL_POLLS * STILL_MS
+local STILL_POLL_MAX_MS = 500
+-- a rough pointer reading (no moved-pointer lobes) is accepted after this many more diff polls
+local ROUGH_EXTRA_POLLS = 2
 local WHEEL_MIN_Y, WHEEL_MAX_Y = 60, 940  -- keep wheel drags on screen (0-1000 units)
 local LOCK_STALE_S = 180   -- a lock not refreshed for this long belongs to a dead job
 -- relay mark slot holding the screen a step decided on; pointer location (wait_still, locate_pointer)
@@ -62,6 +78,16 @@ local lock_path = storage.join_path(phone_dir, "agent.lock")
 
 local function log(...)
     print(string.format(...))
+end
+
+-- Milliseconds spent per kind of work in the current step, logged as "timing step N: ..." so slow
+-- steps can be broken down from the serial log (look = vision model, still = waiting for a still
+-- screen, locate = pointer wiggle and diff polling, confirm = the extra look before tap!).
+local timing = {}
+local TIMING_KEYS = {"look", "confirm", "still", "locate"}
+
+local function spent(key, since)
+    timing[key] = (timing[key] or 0) + (system.millis() - since)
 end
 
 local function load_span()
@@ -131,7 +157,10 @@ local function require_hid()
     end
 end
 
+local last_input = 0  -- system.millis() of the last HID report: its frames arrive later
+
 local function move_paced(dx, dy)
+    last_input = system.millis()
     while dx ~= 0 or dy ~= 0 do
         local sx = math.max(-STEP, math.min(STEP, dx))
         local sy = math.max(-STEP, math.min(STEP, dy))
@@ -139,6 +168,7 @@ local function move_paced(dx, dy)
         dx, dy = dx - sx, dy - sy
         delay.delay_ms(STEP_MS)
     end
+    last_input = system.millis()
 end
 
 local function home()
@@ -146,6 +176,7 @@ local function home()
         ble_hid.mouse_move(-127, -127)
         delay.delay_ms(4)
     end
+    last_input = system.millis()
     delay.delay_ms(100)
 end
 
@@ -154,10 +185,10 @@ local function units(span, dx, dy)  -- 0-1000 screen delta -> mouse units
 end
 
 -- A single failed relay request (seen once: ESP_FAIL right after a save) must not end the run.
-local function screen_diff(op, near, slot)
+local function screen_diff(op, near, slot, pointer)
     local ok, out, err
     for attempt = 1, DIFF_ATTEMPTS do
-        ok, out, err = capability.call("phone_screen_diff", {op = op, near = near, slot = slot})
+        ok, out, err = capability.call("phone_screen_diff", {op = op, near = near, slot = slot, pointer = pointer})
         if ok then
             return json.decode(out)
         end
@@ -168,8 +199,8 @@ local function screen_diff(op, near, slot)
 end
 
 -- The mirrored frame lags the phone by ~0.3-0.7 s and animations (app launch, sheets) take longer:
--- wait until two frames in a row are equal before looking or locating the pointer.
-local function wait_still()
+-- wait until nothing changed over a window before looking or locating the pointer.
+local function wait_still_window()
     for _ = 1, STILL_POLLS do
         screen_diff("mark")
         delay.delay_ms(STILL_MS)
@@ -181,22 +212,73 @@ local function wait_still()
     return false
 end
 
+local relay_has_still = true  -- cleared when the relay answers /still with an error (older relay)
+
+-- latency: how old the last input must be (POINTER_LATENCY_MS after pointer-only moves).
+local function wait_still(latency)
+    local t0 = system.millis()
+    latency = latency or INPUT_LATENCY_MS
+    local result
+    while relay_has_still do
+        local ok, st = pcall(screen_diff, "still")
+        if not ok or not st.ok or type(st.since_ms) ~= "number" then
+            log("wait_still: relay /still unavailable (%s); using the fixed window", tostring(ok and json.encode(st) or st))
+            relay_has_still = false
+            break
+        end
+        local now = system.millis()
+        local wait = math.max(latency - (now - last_input), QUIET_MS - st.since_ms)
+        if wait <= 0 then
+            result = true
+            break
+        end
+        if now - t0 > STILL_TIMEOUT_MS then
+            result = false
+            break
+        end
+        delay.delay_ms(math.min(wait, STILL_POLL_MAX_MS))
+    end
+    if result == nil then
+        result = wait_still_window()
+    end
+    spent("still", t0)
+    return result
+end
+
 -- Wiggle the pointer and see where the screen changed (port of Pointer.findPointer). nil if unsure.
--- near = {x, y}: where we expect it; changes elsewhere (hover highlights) are ignored.
+-- near = {x, y}: where we expect it. The relay then picks the changed region that looks like a
+-- moved pointer (two opposite lobes, the newer one towards +x +y) nearest to it and measures where
+-- the pointer rested, to the pixel; a fading AssistiveTouch button or a hover highlight is skipped.
 local function locate_pointer(near)
-    local still = wait_still()
+    local still = wait_still(POINTER_LATENCY_MS)
+    local t0 = system.millis()
     screen_diff("mark")
     move_paced(NUDGE, NUDGE)
     local d
+    local rough_polls = 0
     for _ = 1, DIFF_POLLS do  -- the mirrored frame arrives ~0.3-0.7 s after the move
         delay.delay_ms(DIFF_POLL_MS)
-        d = screen_diff("diff", near)
+        d = screen_diff("diff", near, nil, near ~= nil)
+        if d.ok and (d.rest or (d.bbox and d.lobes == nil)) then
+            break  -- a pointer reading (or a plain change from a relay without pointer=1)
+        end
         if d.ok and d.bbox then
-            break
+            -- only a region without the moved-pointer lobes: give the lobes a few more frames,
+            -- then take the rough reading instead of polling out the whole 2.5 s
+            rough_polls = rough_polls + 1
+            if rough_polls > ROUGH_EXTRA_POLLS then
+                break
+            end
         end
     end
+    -- Leaving the pointer where the nudge put it (and aiming short by the nudge) was tried on
+    -- 2026-10-22 and did not converge: the measured nudge is too noisy. Move back instead.
     move_paced(-NUDGE, -NUDGE)
     delay.delay_ms(200)
+    spent("locate", t0)
+    if d.ok and d.rest then
+        return d.rest[1], d.rest[2], false
+    end
     if not d.ok or not d.bbox then
         log("locate: no change seen (still=%s, last diff %s)", tostring(still), json.encode(d))
         return nil
@@ -209,7 +291,7 @@ local function locate_pointer(near)
     -- the box spans the pointer at rest and the nudged pointer: take the half nearest to the rest
     -- position (the nudge goes +x +y)
     local half_x, half_y = NUDGE / 2 / span_hint.w * 1000, NUDGE / 2 / span_hint.h * 1000
-    return math.floor(d.center[1] - half_x + 0.5), math.floor(d.center[2] - half_y + 0.5)
+    return math.floor(d.center[1] - half_x + 0.5), math.floor(d.center[2] - half_y + 0.5), true
 end
 
 -- Open-loop move from the corner, then locate the pointer and correct (relative moves are not
@@ -220,21 +302,34 @@ end
 -- jumping between icons instead of a small dot, and refusing every such tap stalls the run.
 -- Whether the action did anything is reported to the model after the step either way.
 local function goto_point(span, x, y, strict)  -- x, y in 0..1000 of the screenshot
-    home()
-    move_paced(units(span, x, y))
+    local function from_corner()  -- open-loop estimate, also the restart after a misreading
+        home()
+        move_paced(units(span, x, y))
+    end
+    local function give_up(why, i)
+        log("aim %d,%d: %s (try %d)%s", x, y, why, i, strict and "" or "; using the estimate")
+        from_corner()
+        delay.delay_ms(TAP_SETTLE_MS)
+        return not strict
+    end
+    local misreads = 0
+    from_corner()
     for i = 1, MAX_CORRECTIONS + 1 do
-        local px, py = locate_pointer({x, y})
-        if not px then
-            log("aim %d,%d: pointer not found (try %d)%s", x, y, i, strict and "" or "; using the estimate")
-            delay.delay_ms(TAP_SETTLE_MS)
-            return not strict
+        local px, py, rough = locate_pointer({x, y})
+        local ex, ey = px and x - px, py and y - py
+        if px then
+            log("aim %d,%d: pointer at %d,%d, error %d,%d (try %d%s)", x, y, px, py, ex, ey, i, rough and ", rough" or "")
         end
-        local ex, ey = x - px, y - py
-        log("aim %d,%d: pointer at %d,%d, error %d,%d (try %d)", x, y, px, py, ex, ey, i)
-        if math.abs(ex) > MAX_AIM_ERROR or math.abs(ey) > MAX_AIM_ERROR then
-            log("aim %d,%d: reading not believable%s", x, y, strict and "" or "; using the estimate")
-            delay.delay_ms(TAP_SETTLE_MS)
-            return not strict
+        local limit = rough and ROUGH_MAX_ERROR or MAX_AIM_ERROR
+        if not px or math.abs(ex) > limit or math.abs(ey) > limit then
+            -- one more look from a fresh open-loop move before tapping on the estimate
+            misreads = misreads + 1
+            if misreads > 1 or i > MAX_CORRECTIONS then
+                return give_up(px and "reading not believable" or "pointer not found", i)
+            end
+            log("aim %d,%d: %s; moving from the corner again", x, y, px and "reading not believable" or "pointer not found")
+            from_corner()
+            goto continue
         end
         if math.abs(ex) <= AIM_TOLERANCE_X and math.abs(ey) <= AIM_TOLERANCE_Y then
             delay.delay_ms(TAP_SETTLE_MS)
@@ -244,17 +339,20 @@ local function goto_point(span, x, y, strict)  -- x, y in 0..1000 of the screens
             return false
         end
         move_paced(units(span, ex * CORRECTION_GAIN, ey * CORRECTION_GAIN))
+        ::continue::
     end
     return false
 end
 
 -- fresh screenshot + vision model in one capability call (inspect_image needs an agent context).
 -- No coordinate grid: its lines ran through small text such as picker wheel digits.
-local function look(prompt)
+local function look(prompt, key)
+    local t0 = system.millis()
     local ok, out, err
     for attempt = 1, LOOK_ATTEMPTS do  -- the vision call can hit a transient network/TLS error
         ok, out, err = capability.call("phone_look", {prompt = prompt, grid = false}, {max_output_bytes = 16384})
         if ok then
+            spent(key or "look", t0)
             return out
         end
         log("phone_look attempt %d failed: %s", attempt, tostring(err or out))
@@ -312,10 +410,10 @@ ANSWER: YES, or NO: <what is wrong>
 -- a fresh screenshot that the control at the measured spot is the intended one before clicking.
 -- x, y: 0-1000 units of the aimed spot.
 local function confirm_click(ctx, label, x, y)
-    wait_still()
+    wait_still(POINTER_LATENCY_MS)  -- only the pointer moved since the screen was last still
     local px, py = math.floor(x / 1000 * IMG_W + 0.5), math.floor(y / 1000 * IMG_H + 0.5)
     local reply = look(string.format(CONFIRM_PROMPT, ctx.goal or "(single action)", label ~= "" and label or "?",
-                                     px, py, IMG_W, IMG_H, ctx.rules or ""))
+                                     px, py, IMG_W, IMG_H, ctx.rules or ""), "confirm")
     log("confirm %q -> %s", label, reply)
     return reply:match("ANSWER:%s*YES") ~= nil, reply
 end
@@ -405,6 +503,7 @@ local function act(span, line, ctx)
         return false, "unknown action: " .. line
     end
     ble_hid.release_all()
+    last_input = system.millis()
     return true
 end
 
@@ -701,6 +800,8 @@ local function run(span, goal, max_steps)
     park_and_mark()
     for step = 1, max_steps do
         refresh_lock()
+        local step_t0 = system.millis()
+        timing = {}
         local recent = #history > 0 and table.concat(history, "\n", math.max(1, #history - 5)) or "(none)"
         local active = {}
         for tag in pairs(prev_tags) do
@@ -734,6 +835,7 @@ local function run(span, goal, max_steps)
             local verb = line:match("^%s*(%a+)")
             verb = verb and verb:lower() or ""
             if verb == "done" then
+                log("timing step %d: total=%d look=%d (ms)", step, system.millis() - step_t0, timing.look or 0)
                 log("done: %s", (line:gsub("^%s*%a+%s*", "")))
                 return true
             elseif verb == "fail" then
@@ -763,6 +865,12 @@ local function run(span, goal, max_steps)
         last_actions = actions
         history[#history + 1] = string.format("%d. %s%s", step, table.concat(did, "; "), effect)
         log("history %s", history[#history])
+        local total, parts, rest = system.millis() - step_t0, {}, system.millis() - step_t0
+        for _, key in ipairs(TIMING_KEYS) do
+            parts[#parts + 1] = string.format("%s=%d", key, timing[key] or 0)
+            rest = rest - (timing[key] or 0)
+        end
+        log("timing step %d: total=%d %s other=%d (ms)", step, total, table.concat(parts, " "), rest)
     end
     log("fail: step limit (%d) reached", max_steps)
     return false

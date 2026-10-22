@@ -16,6 +16,7 @@
 #include "claw_cap.h"
 #include "claw_core_llm.h"
 #include "claw_paths.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -34,11 +35,11 @@ static const char *TAG = "cap_phone_screen";
 #define PHONE_SCREEN_NVS_SEED        "ed25519_seed"
 #define PHONE_SCREEN_DIR             "phone"
 #define PHONE_SCREEN_FILE            "phone/screen.jpg"
-#define PHONE_LOOK_FILE              "phone/look.jpg"  /* the frame the model saw (grid optional) */
 #define PHONE_SCREEN_PATH_MAX        160
 #define PHONE_SCREEN_URL_MAX         128
 #define PHONE_SCREEN_HTTP_TIMEOUT_MS 5000
 #define PHONE_SCREEN_IO_CHUNK        4096
+#define PHONE_FRAME_MAX_BYTES        (512 * 1024)  /* a 540-wide JPEG is ~30-60 KB */
 #define PHONE_SCREEN_READ_RETRIES    5     /* empty reads tolerated before a frame download is abandoned */
 #define PHONE_LOOK_LOG_CHARS         600   /* model reply echoed to the console for each phone_look */
 #define PHONE_SCREEN_WAIT_IP_MS      1000
@@ -117,19 +118,22 @@ static void airplay_start_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* GET http://relay/frame.jpg (grid: with the coordinate grid) into path; returns the HTTP status or -1. */
-static int fetch_frame(const char *path, bool grid, size_t *out_bytes, char *err, size_t err_size)
+/* GET http://relay/frame.jpg (grid: with the coordinate grid) into a PSRAM buffer the caller frees;
+ * returns the HTTP status or -1. Kept in memory: writing the JPEG to the FAT partition and reading it
+ * back cost ~1 s per look. */
+static int fetch_frame_mem(bool grid, uint8_t **out_buf, size_t *out_bytes, char *err, size_t err_size)
 {
     char url[PHONE_SCREEN_URL_MAX];
-    char *buf = NULL;
+    uint8_t *buf = NULL;
     esp_http_client_config_t http = {
         .url = url,
         .timeout_ms = PHONE_SCREEN_HTTP_TIMEOUT_MS,
+        .buffer_size = PHONE_SCREEN_IO_CHUNK,
     };
     esp_http_client_handle_t client;
-    FILE *f = NULL;
     int status = -1;
 
+    *out_buf = NULL;
     *out_bytes = 0;
     snprintf(url, sizeof(url), "http://%s:%d/frame.jpg%s", CONFIG_CAP_PHONE_SCREEN_RELAY_HOST,
              CONFIG_CAP_PHONE_SCREEN_RELAY_HTTP_PORT, grid ? "?grid=1" : "");
@@ -148,42 +152,65 @@ static int fetch_frame(const char *path, bool grid, size_t *out_bytes, char *err
         snprintf(err, err_size, "relay answered HTTP %d (no frame yet? start Screen Mirroring)", status);
         goto done;
     }
-    buf = malloc(PHONE_SCREEN_IO_CHUNK);
-    f = buf ? fopen(path, "wb") : NULL;
-    if (!f) {
-        snprintf(err, err_size, buf ? "cannot write %s" : "out of memory for %s", path);
+    if (content_length <= 0 || content_length > PHONE_FRAME_MAX_BYTES) {
+        snprintf(err, err_size, "relay sent a frame of unexpected size (%lld bytes)", (long long)content_length);
+        status = -1;
+        goto done;
+    }
+    buf = heap_caps_malloc((size_t)content_length, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        snprintf(err, err_size, "out of memory for a %lld-byte frame", (long long)content_length);
         status = -1;
         goto done;
     }
     /* read exactly Content-Length: a short read under Wi-Fi load must not hand a truncated JPEG to
      * the vision model (it rejects it as "unsupported image") */
-    for (int stalls = 0; content_length <= 0 || (int64_t)*out_bytes < content_length;) {
-        int n = esp_http_client_read(client, buf, PHONE_SCREEN_IO_CHUNK);
+    for (int stalls = 0; (int64_t)*out_bytes < content_length;) {
+        int n = esp_http_client_read(client, (char *)buf + *out_bytes, (int)(content_length - (int64_t)*out_bytes));
         if (n > 0) {
-            if (fwrite(buf, 1, (size_t)n, f) != (size_t)n) {
-                snprintf(err, err_size, "write failed (storage full?)");
-                status = -1;
-                break;
-            }
             *out_bytes += (size_t)n;
             stalls = 0;
             continue;
         }
-        if (content_length <= 0 || n < -ESP_ERR_HTTP_EAGAIN || ++stalls > PHONE_SCREEN_READ_RETRIES) {
-            break;  /* no length to wait for, a real error, or the relay stopped sending */
+        if (n < -ESP_ERR_HTTP_EAGAIN || ++stalls > PHONE_SCREEN_READ_RETRIES) {
+            break;  /* a real error, or the relay stopped sending */
         }
     }
-    if (status == 200 && content_length > 0 && (int64_t)*out_bytes != content_length) {
+    if ((int64_t)*out_bytes != content_length) {
         snprintf(err, err_size, "frame truncated (%u of %lld bytes)", (unsigned)*out_bytes, (long long)content_length);
         status = -1;
     }
 done:
+    if (status == 200) {
+        *out_buf = buf;
+    } else {
+        free(buf);
+        *out_bytes = 0;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return status;
+}
+
+/* fetch_frame_mem() into a file at path (phone_screenshot hands a path to inspect_image). */
+static int fetch_frame(const char *path, bool grid, size_t *out_bytes, char *err, size_t err_size)
+{
+    uint8_t *buf = NULL;
+    int status = fetch_frame_mem(grid, &buf, out_bytes, err, err_size);
+    FILE *f;
+
+    if (status != 200) {
+        return status;
+    }
+    f = fopen(path, "wb");
+    if (!f || fwrite(buf, 1, *out_bytes, f) != *out_bytes) {
+        snprintf(err, err_size, f ? "write failed (storage full?)" : "cannot write %s", path);
+        status = -1;
+    }
     if (f) {
         fclose(f);
     }
     free(buf);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
     return status;
 }
 
@@ -229,6 +256,7 @@ static esp_err_t phone_screen_diff_execute(const char *input_json, const claw_ca
     cJSON *op = root ? cJSON_GetObjectItem(root, "op") : NULL;
     cJSON *near = root ? cJSON_GetObjectItem(root, "near") : NULL;
     cJSON *slot = root ? cJSON_GetObjectItem(root, "slot") : NULL;
+    bool pointer = root && cJSON_IsTrue(cJSON_GetObjectItem(root, "pointer"));
     char path[PHONE_SCREEN_URL_MAX] = {0};
     char slot_name[PHONE_DIFF_SLOT_MAX] = "default";
     esp_err_t ret;
@@ -251,18 +279,21 @@ static esp_err_t phone_screen_diff_execute(const char *input_json, const claw_ca
     }
     if (cJSON_IsString(op) && !strcmp(op->valuestring, "mark")) {
         snprintf(path, sizeof(path), "/mark?slot=%s", slot_name);
+    } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "still")) {
+        snprintf(path, sizeof(path), "/still");
     } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "diff")) {
         if (cJSON_IsArray(near) && cJSON_GetArraySize(near) == 2 &&
                 cJSON_IsNumber(cJSON_GetArrayItem(near, 0)) && cJSON_IsNumber(cJSON_GetArrayItem(near, 1))) {
-            snprintf(path, sizeof(path), "/diff?slot=%s&near=%d,%d", slot_name,
-                     cJSON_GetArrayItem(near, 0)->valueint, cJSON_GetArrayItem(near, 1)->valueint);
+            snprintf(path, sizeof(path), "/diff?slot=%s&near=%d,%d%s", slot_name,
+                     cJSON_GetArrayItem(near, 0)->valueint, cJSON_GetArrayItem(near, 1)->valueint,
+                     pointer ? "&pointer=1" : "");
         } else {
             snprintf(path, sizeof(path), "/diff?slot=%s", slot_name);
         }
     }
     cJSON_Delete(root);
     if (!path[0]) {
-        snprintf(output, output_size, "Error: op must be \"mark\" or \"diff\"");
+        snprintf(output, output_size, "Error: op must be \"mark\", \"diff\" or \"still\"");
         return ESP_ERR_INVALID_ARG;
     }
     ret = relay_get_text(path, output, output_size);
@@ -300,11 +331,10 @@ static esp_err_t phone_look_execute(const char *input_json, const claw_cap_call_
     claw_core_handle_t core = (ctx && ctx->core) ? ctx->core : (s_get_core ? s_get_core() : NULL);
     claw_media_asset_t asset = {0};
     claw_llm_media_request_t request = {0};
-    char dir[PHONE_SCREEN_PATH_MAX];
-    char path[PHONE_SCREEN_PATH_MAX];
     char err[160] = {0};
     char *text = NULL;
     char *llm_err = NULL;
+    uint8_t *frame = NULL;
     size_t bytes = 0;
     cJSON *root = cJSON_Parse(input_json ? input_json : "{}");
     cJSON *prompt = root ? cJSON_GetObjectItem(root, "prompt") : NULL;
@@ -321,35 +351,36 @@ static esp_err_t phone_look_execute(const char *input_json, const claw_cap_call_
         snprintf(output, output_size, "Error: claw_core is not ready");
         return ESP_ERR_INVALID_STATE;
     }
-    if (claw_paths_join(CLAW_PATH_DATA, PHONE_SCREEN_DIR, dir, sizeof(dir)) != ESP_OK ||
-            claw_paths_join(CLAW_PATH_DATA, PHONE_LOOK_FILE, path, sizeof(path)) != ESP_OK) {
-        cJSON_Delete(root);
-        snprintf(output, output_size, "Error: DATA path is not ready");
-        return ESP_ERR_INVALID_STATE;
-    }
-    mkdir(dir, 0775);
-    if (fetch_frame(path, grid, &bytes, err, sizeof(err)) != 200) {
+    int64_t started_us = esp_timer_get_time();
+    if (fetch_frame_mem(grid, &frame, &bytes, err, sizeof(err)) != 200) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: %s", err);
         return ESP_FAIL;
     }
-    asset.kind = CLAW_MEDIA_ASSET_KIND_LOCAL_PATH;
-    asset.path = path;
+    asset.kind = CLAW_MEDIA_ASSET_KIND_INLINE_BYTES;
+    asset.bytes = frame;
+    asset.byte_count = bytes;
+    asset.mime_type = "image/jpeg";
     request.system_prompt = grid ? PHONE_LOOK_GRID_SYSTEM_PROMPT : PHONE_LOOK_SYSTEM_PROMPT;
     request.user_prompt = prompt->valuestring;
     request.media = &asset;
     request.media_count = 1;
+    int64_t fetched_us = esp_timer_get_time();
     ret = claw_core_llm_infer_media(core, &request, &text, &llm_err);
+    int64_t inferred_us = esp_timer_get_time();
     cJSON_Delete(root);
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Error: vision model failed (%s)%s%s", esp_err_to_name(ret),
                  llm_err ? ": " : "", llm_err ? llm_err : "");
     } else {
         snprintf(output, output_size, "%s", text ? text : "");
-        ESP_LOGI(TAG, "phone_look (%u-byte frame) -> %.*s", (unsigned)bytes, PHONE_LOOK_LOG_CHARS, text ? text : "");
+        ESP_LOGI(TAG, "phone_look (%u-byte frame, fetch %d ms, model %d ms) -> %.*s", (unsigned)bytes,
+                 (int)((fetched_us - started_us) / 1000), (int)((inferred_us - fetched_us) / 1000),
+                 PHONE_LOOK_LOG_CHARS, text ? text : "");
     }
     free(text);
     free(llm_err);
+    free(frame);
     return ret;
 }
 
@@ -410,14 +441,17 @@ static const claw_cap_descriptor_t s_phone_screen_descriptors[] = {
         .name = "phone_screen_diff",
         .family = "phone",
         .description =
-        "Pixel change detector on the mirrored phone screen. op=mark remembers the current frame; op=diff "
+        "Pixel change detector on the mirrored phone screen. op=still returns {since_ms} (how long the screen "
+        "has not changed); op=mark remembers the current frame; op=diff "
         "returns {changed, bbox, center} (0-1000 coordinates) of what changed since mark; optional near=[x,y] "
-        "only looks around that point; optional slot=name keeps a separate mark per name. Used to find the "
-        "pointer (wiggle it between mark and diff) and to check whether an action changed the screen.",
+        "only looks around that point; with near, pointer=true means the pointer was nudged by +x +y since mark: "
+        "the region that looks like a moved pointer is picked and its resting position returned as rest=[x,y]; "
+        "optional slot=name keeps a separate mark per name. Used to find the pointer and to check whether an "
+        "action changed the screen.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"mark\",\"diff\"]},\"near\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}},\"slot\":{\"type\":\"string\"}},\"required\":[\"op\"]}",
+        "{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"mark\",\"diff\",\"still\"]},\"near\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}},\"pointer\":{\"type\":\"boolean\"},\"slot\":{\"type\":\"string\"}},\"required\":[\"op\"]}",
         .execute = phone_screen_diff_execute,
     },
     {

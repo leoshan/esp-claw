@@ -70,6 +70,74 @@ static const char *image_mime_from_path(const char *path)
     return NULL;
 }
 
+/* raw image bytes -> "data:<mime>;base64,..." in out_prepared */
+static esp_err_t build_data_url(const unsigned char *raw,
+                                size_t size,
+                                const char *mime,
+                                claw_media_prepared_t *out_prepared,
+                                char **out_error_message)
+{
+    unsigned char *encoded = NULL;
+    size_t encoded_len = (size + 2) / 3 * 4;
+    size_t prefix_len;
+    char *data_url = NULL;
+
+    encoded = calloc(1, encoded_len + 1);
+    if (!encoded) {
+        *out_error_message = dup_printf("Out of memory encoding media");
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (mbedtls_base64_encode(encoded, encoded_len + 1, &encoded_len, raw, size) != 0) {
+        free(encoded);
+        *out_error_message = dup_printf("Failed to base64-encode media");
+        return ESP_FAIL;
+    }
+
+    prefix_len = strlen("data:") + strlen(mime) + strlen(";base64,");
+    data_url = calloc(1, prefix_len + encoded_len + 1);
+    if (!data_url) {
+        free(encoded);
+        *out_error_message = dup_printf("Out of memory building media payload");
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(data_url, prefix_len + 1, "data:%s;base64,", mime);
+    memcpy(data_url + prefix_len, encoded, encoded_len);
+    data_url[prefix_len + encoded_len] = '\0';
+
+    out_prepared->kind = CLAW_MEDIA_PREPARED_KIND_DATA_URL;
+    out_prepared->payload = data_url;
+    out_prepared->original_size = size;
+    strlcpy(out_prepared->mime_type, mime, sizeof(out_prepared->mime_type));
+
+    free(encoded);
+    return ESP_OK;
+}
+
+/* Image bytes the caller already holds in memory (e.g. a frame just downloaded): no file round trip. */
+static esp_err_t prepare_inline_bytes_asset(const claw_media_asset_t *asset,
+                                            size_t image_max_bytes,
+                                            claw_media_prepared_t *out_prepared,
+                                            char **out_error_message)
+{
+    if (!asset->bytes || asset->byte_count == 0) {
+        *out_error_message = dup_printf("inline media is empty");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!asset->mime_type || strncmp(asset->mime_type, "image/", strlen("image/")) != 0) {
+        *out_error_message = dup_printf("inline media needs an image/* mime type");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (asset->byte_count > image_max_bytes) {
+        *out_error_message = dup_printf("Media is too large (%u bytes > %u bytes)",
+                                        (unsigned)asset->byte_count,
+                                        (unsigned)image_max_bytes);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return build_data_url(asset->bytes, asset->byte_count, asset->mime_type, out_prepared, out_error_message);
+}
+
 static esp_err_t prepare_local_path_asset(const claw_media_asset_t *asset,
                                           const claw_llm_model_profile_t *profile,
                                           size_t image_max_bytes,
@@ -79,12 +147,9 @@ static esp_err_t prepare_local_path_asset(const claw_media_asset_t *asset,
     struct stat st = {0};
     FILE *file = NULL;
     unsigned char *raw = NULL;
-    unsigned char *encoded = NULL;
-    size_t encoded_len = 0;
-    size_t prefix_len;
     size_t read_len;
     const char *mime;
-    char *data_url = NULL;
+    esp_err_t ret;
 
     if (!asset->path || !asset->path[0]) {
         *out_error_message = dup_printf("media path is empty");
@@ -136,43 +201,10 @@ static esp_err_t prepare_local_path_asset(const claw_media_asset_t *asset,
         return ESP_FAIL;
     }
 
-    encoded_len = ((size_t)st.st_size + 2) / 3 * 4;
-    encoded = calloc(1, encoded_len + 1);
-    if (!encoded) {
-        free(raw);
-        *out_error_message = dup_printf("Out of memory encoding media");
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (mbedtls_base64_encode(encoded, encoded_len + 1, &encoded_len, raw, (size_t)st.st_size) != 0) {
-        free(raw);
-        free(encoded);
-        *out_error_message = dup_printf("Failed to base64-encode media");
-        return ESP_FAIL;
-    }
-
-    prefix_len = strlen("data:") + strlen(mime) + strlen(";base64,");
-    data_url = calloc(1, prefix_len + encoded_len + 1);
-    if (!data_url) {
-        free(raw);
-        free(encoded);
-        *out_error_message = dup_printf("Out of memory building media payload");
-        return ESP_ERR_NO_MEM;
-    }
-
-    snprintf(data_url, prefix_len + 1, "data:%s;base64,", mime);
-    memcpy(data_url + prefix_len, encoded, encoded_len);
-    data_url[prefix_len + encoded_len] = '\0';
-
-    out_prepared->kind = CLAW_MEDIA_PREPARED_KIND_DATA_URL;
-    out_prepared->payload = data_url;
-    out_prepared->original_size = (size_t)st.st_size;
-    strlcpy(out_prepared->mime_type, mime, sizeof(out_prepared->mime_type));
-
+    ret = build_data_url(raw, (size_t)st.st_size, mime, out_prepared, out_error_message);
     free(raw);
-    free(encoded);
     (void)profile;
-    return ESP_OK;
+    return ret;
 }
 
 esp_err_t claw_media_prepare_asset(const claw_media_asset_t *asset,
@@ -205,7 +237,7 @@ esp_err_t claw_media_prepare_asset(const claw_media_asset_t *asset,
         return ESP_OK;
     }
 
-    if (asset->kind != CLAW_MEDIA_ASSET_KIND_LOCAL_PATH) {
+    if (asset->kind != CLAW_MEDIA_ASSET_KIND_LOCAL_PATH && asset->kind != CLAW_MEDIA_ASSET_KIND_INLINE_BYTES) {
         *out_error_message = dup_printf("Unsupported media asset kind");
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -213,6 +245,10 @@ esp_err_t claw_media_prepare_asset(const claw_media_asset_t *asset,
     if (profile->image_remote_url_only) {
         *out_error_message = dup_printf("Selected profile only supports remote image URLs");
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (asset->kind == CLAW_MEDIA_ASSET_KIND_INLINE_BYTES) {
+        return prepare_inline_bytes_asset(asset, image_max_bytes, out_prepared, out_error_message);
     }
 
     return prepare_local_path_asset(asset, profile, image_max_bytes, out_prepared, out_error_message);

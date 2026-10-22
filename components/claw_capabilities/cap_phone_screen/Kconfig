@@ -8,7 +8,7 @@ menu "Phone screen (AirPlay receiver)"
             Name shown in the phone's Control Center -> Screen Mirroring list.
 
     config CAP_PHONE_SCREEN_RELAY_HOST
-        string "Relay host (LAN IP of the machine running phone_relay/relay.py)"
+        string "Relay host (LAN IP of the machine running tools/phone_relay/relay.py)"
         default ""
 
     config CAP_PHONE_SCREEN_RELAY_STREAM_PORT

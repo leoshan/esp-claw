@@ -176,7 +176,7 @@ menu "App Claw Config"
             default n
             help
                 Make the board an AirPlay screen-mirroring receiver and forward the phone's
-                H.264 stream to a LAN relay (phone_relay/relay.py) that serves the latest
+                H.264 stream to a LAN relay (tools/phone_relay/relay.py) that serves the latest
                 frame. Links GPL-3.0 code (ported from UxPlay): firmware built with this
                 option must be distributed under the GPL.
 

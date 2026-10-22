@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * Eyes of the phone agent: the board is an AirPlay receiver ("Screen Mirroring" on the phone),
- * forwards the H.264 stream to a relay on the LAN (phone_relay/relay.py) and fetches the latest
+ * forwards the H.264 stream to a relay on the LAN (tools/phone_relay/relay.py) and fetches the latest
  * decoded frame from it as JPEG into the DATA root, where inspect_image and the agent read it.
  */
 #include "cap_phone_screen.h"

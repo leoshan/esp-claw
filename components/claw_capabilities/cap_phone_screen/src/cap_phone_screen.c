@@ -63,6 +63,12 @@ static const char *PHONE_LOOK_GRID_SYSTEM_PROMPT =
     "columns and 10 equal rows, thick lines mark the middle. The grid is not part of the phone screen. Use the "
     "coordinate convention the user prompt asks for.";
 
+static const char *PHONE_LOOK_MARKS_SYSTEM_PROMPT =
+    PHONE_LOOK_PROMPT_BASE
+    "Red tags with white numbers are drawn at the left edge of list rows (some sit on headers and gaps); "
+    "they are not part of the phone screen. Name a row by the number on the tag on the same line as its "
+    "label. Use the coordinate convention the user prompt asks for for anything else.";
+
 static void airplay_log(const char *msg)
 {
     ESP_LOGI(TAG, "%s", msg);
@@ -118,10 +124,11 @@ static void airplay_start_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* GET http://relay/frame.jpg (grid: with the coordinate grid) into a PSRAM buffer the caller frees;
+/* GET http://relay/frame.jpg<query> ("?grid=1": with the coordinate grid, "?marks=1": with numbered
+ * row tags) into a PSRAM buffer the caller frees;
  * returns the HTTP status or -1. Kept in memory: writing the JPEG to the FAT partition and reading it
  * back cost ~1 s per look. */
-static int fetch_frame_mem(bool grid, uint8_t **out_buf, size_t *out_bytes, char *err, size_t err_size)
+static int fetch_frame_mem(const char *query, uint8_t **out_buf, size_t *out_bytes, char *err, size_t err_size)
 {
     char url[PHONE_SCREEN_URL_MAX];
     uint8_t *buf = NULL;
@@ -136,7 +143,7 @@ static int fetch_frame_mem(bool grid, uint8_t **out_buf, size_t *out_bytes, char
     *out_buf = NULL;
     *out_bytes = 0;
     snprintf(url, sizeof(url), "http://%s:%d/frame.jpg%s", CONFIG_CAP_PHONE_SCREEN_RELAY_HOST,
-             CONFIG_CAP_PHONE_SCREEN_RELAY_HTTP_PORT, grid ? "?grid=1" : "");
+             CONFIG_CAP_PHONE_SCREEN_RELAY_HTTP_PORT, query);
     client = esp_http_client_init(&http);
     if (!client) {
         snprintf(err, err_size, "http client init failed");
@@ -196,7 +203,7 @@ done:
 static int fetch_frame(const char *path, bool grid, size_t *out_bytes, char *err, size_t err_size)
 {
     uint8_t *buf = NULL;
-    int status = fetch_frame_mem(grid, &buf, out_bytes, err, err_size);
+    int status = fetch_frame_mem(grid ? "?grid=1" : "", &buf, out_bytes, err, err_size);
     FILE *f;
 
     if (status != 200) {
@@ -281,6 +288,13 @@ static esp_err_t phone_screen_diff_execute(const char *input_json, const claw_ca
         snprintf(path, sizeof(path), "/mark?slot=%s", slot_name);
     } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "still")) {
         snprintf(path, sizeof(path), "/still");
+    } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "rows")) {
+        snprintf(path, sizeof(path), "/rows");
+    } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "row") && cJSON_IsArray(near) &&
+               cJSON_GetArraySize(near) == 2 && cJSON_IsNumber(cJSON_GetArrayItem(near, 0)) &&
+               cJSON_IsNumber(cJSON_GetArrayItem(near, 1))) {
+        snprintf(path, sizeof(path), "/row?x=%d&y=%d", cJSON_GetArrayItem(near, 0)->valueint,
+                 cJSON_GetArrayItem(near, 1)->valueint);
     } else if (cJSON_IsString(op) && !strcmp(op->valuestring, "diff")) {
         if (cJSON_IsArray(near) && cJSON_GetArraySize(near) == 2 &&
                 cJSON_IsNumber(cJSON_GetArrayItem(near, 0)) && cJSON_IsNumber(cJSON_GetArrayItem(near, 1))) {
@@ -293,7 +307,7 @@ static esp_err_t phone_screen_diff_execute(const char *input_json, const claw_ca
     }
     cJSON_Delete(root);
     if (!path[0]) {
-        snprintf(output, output_size, "Error: op must be \"mark\", \"diff\" or \"still\"");
+        snprintf(output, output_size, "Error: op must be \"mark\", \"diff\", \"still\", \"rows\" or \"row\" (with near)");
         return ESP_ERR_INVALID_ARG;
     }
     ret = relay_get_text(path, output, output_size);
@@ -339,6 +353,7 @@ static esp_err_t phone_look_execute(const char *input_json, const claw_cap_call_
     cJSON *root = cJSON_Parse(input_json ? input_json : "{}");
     cJSON *prompt = root ? cJSON_GetObjectItem(root, "prompt") : NULL;
     bool grid = root && cJSON_IsTrue(cJSON_GetObjectItem(root, "grid"));
+    bool marks = root && cJSON_IsTrue(cJSON_GetObjectItem(root, "marks"));
     esp_err_t ret;
 
     if (!cJSON_IsString(prompt) || !prompt->valuestring[0]) {
@@ -352,7 +367,7 @@ static esp_err_t phone_look_execute(const char *input_json, const claw_cap_call_
         return ESP_ERR_INVALID_STATE;
     }
     int64_t started_us = esp_timer_get_time();
-    if (fetch_frame_mem(grid, &frame, &bytes, err, sizeof(err)) != 200) {
+    if (fetch_frame_mem(marks ? "?marks=1" : grid ? "?grid=1" : "", &frame, &bytes, err, sizeof(err)) != 200) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: %s", err);
         return ESP_FAIL;
@@ -361,7 +376,8 @@ static esp_err_t phone_look_execute(const char *input_json, const claw_cap_call_
     asset.bytes = frame;
     asset.byte_count = bytes;
     asset.mime_type = "image/jpeg";
-    request.system_prompt = grid ? PHONE_LOOK_GRID_SYSTEM_PROMPT : PHONE_LOOK_SYSTEM_PROMPT;
+    request.system_prompt = marks ? PHONE_LOOK_MARKS_SYSTEM_PROMPT
+                            : grid ? PHONE_LOOK_GRID_SYSTEM_PROMPT : PHONE_LOOK_SYSTEM_PROMPT;
     request.user_prompt = prompt->valuestring;
     request.media = &asset;
     request.media_count = 1;
@@ -428,12 +444,13 @@ static const claw_cap_descriptor_t s_phone_screen_descriptors[] = {
         .family = "phone",
         .description =
         "Take a fresh screenshot of the mirrored phone and ask the vision model about it in one step. "
-        "Input {prompt, grid}: what to look for and the reply format; grid=true overlays a 10x10 coordinate "
-        "grid (helps locating, but hides small text). Returns the model's answer.",
+        "Input {prompt, grid, marks}: what to look for and the reply format; grid=true overlays a 10x10 "
+        "coordinate grid (helps locating, but hides small text); marks=true draws numbered tags on the list "
+        "rows (see phone_screen_diff op=rows). Returns the model's answer.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"},\"grid\":{\"type\":\"boolean\"}},\"required\":[\"prompt\"]}",
+        "{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\"},\"grid\":{\"type\":\"boolean\"},\"marks\":{\"type\":\"boolean\"}},\"required\":[\"prompt\"]}",
         .execute = phone_look_execute,
     },
     {
@@ -441,8 +458,10 @@ static const claw_cap_descriptor_t s_phone_screen_descriptors[] = {
         .name = "phone_screen_diff",
         .family = "phone",
         .description =
-        "Pixel change detector on the mirrored phone screen. op=still returns {since_ms} (how long the screen "
-        "has not changed); op=mark remembers the current frame; op=diff "
+        "Pixel change detector on the mirrored phone screen. op=still returns {since_ms, w, h} (how long the "
+        "screen has not changed, frame size); op=row with near=[x,y] returns the list row around that point "
+        "{row, top, bottom, center}; op=rows returns the rows tagged on the last phone_look with marks=true "
+        "{rows:[{n, top, bottom, center}]}; op=mark remembers the current frame; op=diff "
         "returns {changed, bbox, center} (0-1000 coordinates) of what changed since mark; optional near=[x,y] "
         "only looks around that point; with near, pointer=true means the pointer was nudged by +x +y since mark: "
         "the region that looks like a moved pointer is picked and its resting position returned as rest=[x,y]; "
@@ -451,7 +470,7 @@ static const claw_cap_descriptor_t s_phone_screen_descriptors[] = {
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
-        "{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"mark\",\"diff\",\"still\"]},\"near\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}},\"pointer\":{\"type\":\"boolean\"},\"slot\":{\"type\":\"string\"}},\"required\":[\"op\"]}",
+        "{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"enum\":[\"mark\",\"diff\",\"still\",\"row\",\"rows\"]},\"near\":{\"type\":\"array\",\"items\":{\"type\":\"number\"}},\"pointer\":{\"type\":\"boolean\"},\"slot\":{\"type\":\"string\"}},\"required\":[\"op\"]}",
         .execute = phone_screen_diff_execute,
     },
     {

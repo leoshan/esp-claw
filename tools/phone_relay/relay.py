@@ -18,8 +18,18 @@ whole session and always holds the latest decoded frame as JPEG.
                                mark (screen before an agent step) survives the short-lived
                                marks of pointer location in between
               GET /still       {"since_ms": how long the screen (below the status bar) has not
-                               changed, "frame_age_ms"}: lets the agent wait exactly until the
-                               screen settles instead of a fixed mark/sleep/diff window
+                               changed, "frame_age_ms", "w", "h" (size of /frame.jpg)}: lets the
+                               agent wait exactly until the screen settles instead of a fixed
+                               mark/sleep/diff window
+              GET /row?x=&y=   the list row (between separator lines / card edges) around x, y
+                               (0-1000 units) in the latest frame: {"top", "bottom", "center"} in
+                               0-1000 units, or {"row": false}; lets the agent tap a row's middle
+                               instead of the edge the vision model pointed at
+              GET /frame.jpg?marks=1  the latest frame with a red numbered tag at the left of every
+                               list row (set-of-marks): the vision model names a row by its number
+                               instead of reading coordinates off the picture
+              GET /rows        the rows numbered by the last /frame.jpg?marks=1: {"rows": [{"n",
+                               "top", "bottom", "center"}]} in 0-1000 units
               ?pointer=1       on /diff with near=: the caller nudged the pointer by +x +y since
                                /mark; pick the changed region nearest to near that looks like a
                                moved pointer and report its resting position as "rest"
@@ -54,6 +64,11 @@ DEFAULT_SLOT = "default"       # /mark and /diff without ?slot=
 # depending on where it came from) and the Clock icon's second hand ticks. Pointer location
 # (/diff?near=) still sees it.
 PARK_MASK = (0, 0, 520, 200)
+# /diff without near= also reports "upper": the fraction of blocks between the status bar and this
+# height that changed. Measured 2026-10-25 on saved frame pairs: opening or leaving a page or a
+# sheet changed 0.34-0.93 of it, while the keyboard sliding up, typing digits and wheeling a picker
+# changed 0-0.02, so the agent can tell a tap that navigated from one that stayed on the page.
+UPPER_BOTTOM = 0.45
 # Pointer location (/diff?pointer=1). A nudged pointer leaves two lobes of opposite sign in the
 # pixel difference: where it was (gone) and where it is now (new), the latter towards +x +y. A
 # fading AssistiveTouch button or a hover highlight changes brightness one way only, so it has a
@@ -67,11 +82,118 @@ LOBE_PAD = 1                   # blocks added around a region when measuring its
 # chain (e.g. this relay restarted mid-session; only a re-cast sends a new IDR). Frames and diffs
 # are refused then, so the agent stops instead of acting on a stale screen.
 STALE_S = 5.0
+# /row: a horizontal line (separator) or card edge is a pixel row of the latest frame that is
+# nearly uniform across the label column and differs from the rows ROW_LINE_GAP above and below.
+# Measured on Settings (540 x 1168): separators are 1 px lines ~8-25 grey levels off white, rows
+# are 70 px apart. The vision model's y is often off by 30-80 px (2026-10-25), so taps hit row
+# edges and the neighbouring row.
+ROW_X0, ROW_X1 = 0.22, 0.87    # fraction of the width scanned (right of the row icons)
+ROW_UNIFORM = 30               # max grey range along a line
+ROW_LINE_STEP = 5              # grey levels a line must differ from the rows around it
+ROW_LINE_GAP = 2               # px between a line and the rows it is compared with
+ROW_MIN_PX, ROW_MAX_PX = 36, 160  # a list row is this tall (screenshot pixels)
 # /still: a decoded frame counts as a change when this many sampled pixels moved by more than
 # CHANGE_LEVEL grey levels (re-encoding noise alone moves a few pixels by a few levels)
 CHANGE_LEVEL = 24
 CHANGE_PIXELS = 3
 CHANGE_STRIDE = 2              # sample every 2nd pixel of every 2nd row
+
+
+# /frame.jpg?marks=1: tags are drawn with this 5 x 7 bitmap font (the ffmpeg build here has no
+# drawtext). Benchmark 2026-10-25 (logs/vision_bench_2026-10-25): asked for the pixel coordinates
+# of a list row, deepseek-flash hit the right row 47% of the time, mostly one or two rows too high;
+# asked for the number of a tagged row, 100% (72/72).
+DIGITS = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+}
+TAG_SCALE = 3                  # font pixel size: digits are 15 x 21 px
+TAG_X = 2                      # tag's left edge, px
+TAG_COLOR, TAG_TEXT = (220, 0, 0), (255, 255, 255)
+
+
+def decode(frame, pix_fmt):
+    """The JPEG's pixels as bytes (gray: 1 byte per pixel, rgb24: 3)."""
+    return subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "rawvideo",
+                           "-pix_fmt", pix_fmt, "pipe:1"], input=frame, capture_output=True).stdout
+
+
+def row_lines(gray, w, h):
+    """For each pixel row of the frame: is it a separator line / card edge (see ROW_*)?"""
+    x0, x1 = int(w * ROW_X0), int(w * ROW_X1)
+    stats = []
+    for py in range(h):
+        line = gray[py * w + x0:py * w + x1:2]
+        stats.append((sum(line) / len(line), max(line) - min(line)))
+    lines = [False] * h
+    for py in range(ROW_LINE_GAP, h - ROW_LINE_GAP):
+        mean, spread = stats[py]
+        above, below = stats[py - ROW_LINE_GAP], stats[py + ROW_LINE_GAP]
+        lines[py] = (spread <= ROW_UNIFORM and above[1] <= ROW_UNIFORM and below[1] <= ROW_UNIFORM
+                     and (abs(mean - above[0]) >= ROW_LINE_STEP or abs(mean - below[0]) >= ROW_LINE_STEP))
+    return lines
+
+
+def find_rows(lines, h):
+    """All list rows, top to bottom, as (top, bottom) px: the space between two neighbouring
+    separators when it is row-sized. Includes the gaps between cards, which are harmless tags."""
+    groups = []  # separators: runs of line pixel rows
+    for py, is_line in enumerate(lines):
+        if not is_line:
+            continue
+        if groups and py - groups[-1][1] <= ROW_LINE_GAP:
+            groups[-1][1] = py
+        else:
+            groups.append([py, py])
+    rows = []
+    for (_, top), (bottom, _) in zip(groups, groups[1:]):
+        if ROW_MIN_PX <= bottom - top <= ROW_MAX_PX and (top + bottom) / 2 > h * STATUS_BAR:
+            rows.append((top, bottom))
+    return rows
+
+
+def draw_tags(rgb, w, h, rows):
+    """Paint a red tag with the row's number (1-based) at the left of each row, in place."""
+    def fill(x0, y0, x1, y1, color):
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+        line = bytes(color) * (x1 - x0)
+        for y in range(y0, y1):
+            rgb[(y * w + x0) * 3:(y * w + x1) * 3] = line
+    s = TAG_SCALE
+    for n, (top, bottom) in enumerate(rows, 1):
+        text = str(n)
+        tw, th = len(text) * 6 * s + 3 * s, 9 * s
+        cy = (top + bottom) // 2
+        y0 = cy - th // 2
+        fill(TAG_X, y0, TAG_X + tw, y0 + th, TAG_COLOR)
+        for i, ch in enumerate(text):
+            for r, bits in enumerate(DIGITS[ch]):
+                for c, bit in enumerate(bits):
+                    if bit == "1":
+                        x = TAG_X + 2 * s + i * 6 * s + c * s
+                        y = y0 + s + r * s
+                        fill(x, y, x + s, y + s, TAG_TEXT)
+
+
+def jpeg_size(data):
+    """(width, height) from a JPEG's SOF marker, or None."""
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            return None
+        marker, seg = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+        if marker in (0xC0, 0xC1, 0xC2):
+            return int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big")
+        i += 2 + seg
+    return None
 
 
 class Relay:
@@ -156,8 +278,75 @@ class Relay:
             if why:
                 return {"ok": False, "error": why}
             now = time.time()
-            return {"ok": True, "since_ms": round((now - self.changed_at) * 1000),
-                    "frame_age_ms": round((now - self.frame_at) * 1000)}
+            frame = self.frame
+            result = {"ok": True, "since_ms": round((now - self.changed_at) * 1000),
+                      "frame_age_ms": round((now - self.frame_at) * 1000)}
+        size = jpeg_size(frame) if frame else None
+        if size:
+            result["w"], result["h"] = size
+        return result
+
+    def row(self, x, y):
+        """The list row around (x, y), both 0-1000 units of the latest frame."""
+        with self.lock:
+            why = self.stalled()
+            if why:
+                return {"ok": False, "error": why}
+            frame = self.frame
+        size = jpeg_size(frame) if frame else None
+        if not size:
+            return {"ok": False, "error": "no frame"}
+        w, h = size
+        gray = decode(frame, "gray")
+        if len(gray) < w * h:
+            return {"ok": False, "error": "could not decode the frame"}
+        lines = row_lines(gray, w, h)
+        is_line = lines.__getitem__
+
+        py = min(h - 1, max(0, round(y / 1000.0 * h)))
+        top = next((t for t in range(py, max(-1, py - ROW_MAX_PX), -1) if is_line(t)), None)
+        bottom = next((b for b in range(py + 1, min(h, py + ROW_MAX_PX)) if is_line(b)), None)
+        k = 1000.0 / h
+        if top is None or bottom is None or not ROW_MIN_PX <= bottom - top <= ROW_MAX_PX:
+            # the lines found on their own: a point right next to one is on the border of two rows
+            # even when the other edge is hidden (e.g. under Settings' floating search field)
+            return {"ok": True, "row": False, "top": None if top is None else round(top * k),
+                    "bottom": None if bottom is None else round(bottom * k)}
+        return {"ok": True, "row": True, "top": round(top * k), "bottom": round(bottom * k),
+                "center": round((top + bottom) / 2 * k)}
+
+    def marked_frame(self):
+        """/frame.jpg?marks=1: (JPEG with numbered row tags, None) or (None, error). The tagged rows
+        are kept for /rows, so a number the model read maps to the frame it saw."""
+        with self.lock:
+            why = self.stalled()
+            frame = self.frame
+        size = jpeg_size(frame) if frame else None
+        if why or not size:
+            return None, why or "no frame yet (is the phone mirroring?)"
+        w, h = size
+        gray, rgb = decode(frame, "gray"), bytearray(decode(frame, "rgb24"))
+        if len(gray) < w * h or len(rgb) < w * h * 3:
+            return None, "could not decode the frame"
+        rows = find_rows(row_lines(gray, w, h), h)
+        draw_tags(rgb, w, h, rows)
+        jpeg = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                               "-s", f"{w}x{h}", "-i", "pipe:0", "-q:v", "4", "-f", "mjpeg", "pipe:1"],
+                              input=bytes(rgb), capture_output=True).stdout
+        if not jpeg:
+            return None, "could not encode the tagged frame"
+        k = 1000.0 / h
+        with self.lock:
+            self.tagged_rows = [{"n": n, "top": round(t * k), "bottom": round(b * k),
+                                 "center": round((t + b) / 2 * k)} for n, (t, b) in enumerate(rows, 1)]
+        return jpeg, None
+
+    def rows(self):
+        with self.lock:
+            rows = getattr(self, "tagged_rows", None)
+        if rows is None:
+            return {"ok": False, "error": "no tagged frame yet (/frame.jpg?marks=1)"}
+        return {"ok": True, "rows": rows}
 
     def stalled(self):
         """Why the latest frame can't be trusted, or None. Call with self.lock held."""
@@ -199,6 +388,10 @@ class Relay:
                     total += sum(abs(a[row + i] - b[row + i]) for i in range(BLOCK))
                 blocks[by][bx] = total / (BLOCK * BLOCK)
         cells = [(y, x) for y in range(bh) for x in range(bw)]
+        upper = None
+        if near is None:  # before the park mask: the pointer is where it tapped, not parked
+            rows = [blocks[y] for y in range(bh) if (y0 + (y + 0.5) * BLOCK) / GRAY_H < UPPER_BOTTOM]
+            upper = round(sum(v >= BLOCK_THRESHOLD for r in rows for v in r) / max(1, len(rows) * bw), 2)
         if near is None:
             mx0, my0, mx1, my1 = PARK_MASK
             for y, x in cells:
@@ -217,7 +410,7 @@ class Relay:
         peak = max((blocks[y][x] for y, x in cells), default=0.0)
         if all_peak < BLOCK_THRESHOLD or peak < BLOCK_THRESHOLD:
             return {"ok": True, "changed": 0 if all_peak < BLOCK_THRESHOLD else 1,
-                    "peak": round(peak, 1), "all_peak": round(all_peak, 1)}
+                    "peak": round(peak, 1), "all_peak": round(all_peak, 1), "upper": upper}
         if pointer and near is not None:
             return self.locate_pointer(a, b, blocks, cells, near, y0)
         # blocks at >= half the peak, then keep the ones near the strongest block
@@ -231,7 +424,7 @@ class Relay:
         to_x = lambda bx: round(bx * BLOCK / GRAY_W * k)
         to_y = lambda by: round((y0 + by * BLOCK) / GRAY_H * k)
         return {
-            "ok": True, "changed": all_hot, "near": len(hot), "peak": round(peak, 1),
+            "ok": True, "changed": all_hot, "near": len(hot), "peak": round(peak, 1), "upper": upper,
             "bbox": [to_x(min(xs)), to_y(min(ys)), to_x(max(xs) + 1), to_y(max(ys) + 1)],
             "center": [round((sum(xs) / len(xs) + 0.5) * BLOCK / GRAY_W * k),
                        round((y0 + (sum(ys) / len(ys) + 0.5) * BLOCK) / GRAY_H * k)],
@@ -397,9 +590,12 @@ def make_handler(relay):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path.startswith("/frame.jpg"):
-                with relay.lock:
-                    frame = relay.grid_frame if "grid=1" in self.path else relay.frame
-                    why = relay.stalled()
+                if "marks=1" in self.path:
+                    frame, why = relay.marked_frame()
+                else:
+                    with relay.lock:
+                        frame = relay.grid_frame if "grid=1" in self.path else relay.frame
+                        why = relay.stalled()
                 if why or not frame:
                     self.send_error(503, why or "no frame yet (is the phone mirroring?)")
                     return
@@ -408,7 +604,7 @@ def make_handler(relay):
                 self.send_header("Content-Length", str(len(frame)))
                 self.end_headers()
                 self.wfile.write(frame)
-            elif self.path.startswith(("/status", "/mark", "/diff", "/still")):
+            elif self.path.startswith(("/status", "/mark", "/diff", "/still", "/row")):  # /row, /rows
                 route, _, query = self.path.partition("?")
                 q = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
                 slot = q.get("slot", DEFAULT_SLOT)
@@ -420,6 +616,10 @@ def make_handler(relay):
                     result = relay.mark(slot)
                 elif route == "/still":
                     result = relay.still()
+                elif route == "/rows":
+                    result = relay.rows()
+                elif route == "/row":
+                    result = relay.row(float(q.get("x", 500)), float(q.get("y", 500)))
                 else:
                     result = relay.status()
                 body = json.dumps(result).encode()

@@ -7,7 +7,7 @@ uses to find the pointer and to tell when the screen has settled.
 
 ```
 iPhone --AirPlay--> board --raw H.264 (TCP 8091)--> relay (ffmpeg)
-board <--HTTP 8090: /frame.jpg, /mark, /diff, /still-- relay
+board <--HTTP 8090: /frame.jpg, /mark, /diff, /still, /row, /rows-- relay
 ```
 
 ## Dependency
@@ -36,7 +36,10 @@ decodable frame, every endpoint refuses with "decoder stalled" instead of servin
 | `GET /mark?slot=` | remembers the current small grey frame |
 | `GET /diff?slot=&near=x,y` | where the screen changed since `/mark` (bbox, center, 0-1000 units); `near` limits the search to around a point |
 | `GET /diff?...&pointer=1` | with `near`: the region that looks like the pointer nudged by +x +y (two opposite-sign lobes) and its resting position `rest` |
-| `GET /still` | `since_ms`: how long the screen below the status bar has not changed |
+| `GET /frame.jpg?marks=1` | latest frame with a red numbered tag at the left of every list row (the vision model names rows by number) |
+| `GET /rows` | the rows tagged on the last `?marks=1` frame: `[{n, top, bottom, center}]`, 0-1000 units |
+| `GET /row?x=&y=` | the list row around a point (between separator lines), or its lone edges |
+| `GET /still` | `since_ms`: how long the screen below the status bar has not changed; `w`, `h` of the frame |
 
 ## Tests (`tests/`)
 

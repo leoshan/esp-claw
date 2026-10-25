@@ -22,6 +22,13 @@
 
 static const char *TAG = "phone_stream";
 
+/* H.264 access unit delimiter, sent after every picture. The relay feeds a raw Annex-B stream to
+ * ffmpeg, whose parser only knows a picture is complete when the next one starts; the phone sends
+ * pictures only when the screen changes, so the last picture of a transition sat in the parser
+ * until the next change (measured 2026-10-25: the board had a new picture 0.2-1.1 s after a click,
+ * the relay showed it 4-14 s later). A delimiter starts the next unit at once. */
+static const uint8_t PHONE_STREAM_AUD[] = {0x00, 0x00, 0x00, 0x01, 0x09, 0xF0};
+
 #define PHONE_STREAM_QUEUE_BYTES   (1024 * 1024)
 #define PHONE_STREAM_CONFIG_MAX    256
 #define PHONE_STREAM_IDR_MAX       (512 * 1024)
@@ -101,7 +108,7 @@ static bool send_anchor(int fd)
         ok = send_all(fd, s_ps.config, s_ps.config_len);
     }
     if (ok && s_ps.idr_len) {
-        ok = send_all(fd, s_ps.idr, s_ps.idr_len);
+        ok = send_all(fd, s_ps.idr, s_ps.idr_len) && send_all(fd, PHONE_STREAM_AUD, sizeof(PHONE_STREAM_AUD));
     }
     xSemaphoreGive(s_ps.lock);
     return ok;
@@ -211,6 +218,7 @@ void phone_stream_on_au(const uint8_t *au, size_t len, bool idr)
     }
     xSemaphoreGive(s_ps.lock);
     enqueue(au, len);
+    enqueue(PHONE_STREAM_AUD, sizeof(PHONE_STREAM_AUD));
 }
 
 void phone_stream_get_stats(phone_stream_stats_t *out)

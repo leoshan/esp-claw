@@ -59,7 +59,7 @@ Rules:
 - Calibrate the pointer (run once after pairing, or when taps miss):
   `{"mode":"calibrate"}`
 - One action, coordinates 0-1000 relative to the screenshot:
-  `{"mode":"act","action":"tap 500 300"}`, `"swipe 500 800 500 300"`, `"type hello"`, `"key enter"`, `"home"`
+  `{"mode":"act","action":"tap 500 300"}`, `"scroll 500 600 400"` (wheel scroll: lists ignore a drag), `"swipe 500 800 500 300"` (a drag), `"type hello"`, `"key enter"`, `"home"`
 - Just look: call `phone_screenshot`, then `inspect_image` with the returned path.
 
 ## Notes

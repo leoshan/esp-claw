@@ -47,7 +47,17 @@
 #define CONSUMER_PRESS_MS 40
 #define CONSUMER_LONG_PRESS_MS 600
 #define CONSUMER_RELEASE_GAP_MS 40
-#define MOUSE_CLICK_MS 40
+/* 2026-10-26: with a 40 ms press the release was sometimes lost on the phone (both reports sent
+ * without error, the row stayed highlighted, no tap): 6/8 clicks worked. An 80 ms press and a second
+ * release report MOUSE_RELEASE_REPEAT_MS later: 8/8. */
+#define MOUSE_CLICK_MS 80
+#define MOUSE_RELEASE_REPEAT_MS 30
+/* A mouse report can be refused while the notification queue is still full of movement reports.
+ * A lost button report used to leave the button "down" in s_mouse_buttons (every later move then
+ * dragged: a move back to the corner became iOS's swipe-back) or on the phone (the click turned
+ * into nothing). Button reports are retried this often, MOUSE_RETRY_MS apart. */
+#define MOUSE_BUTTON_TRIES 5
+#define MOUSE_RETRY_MS 20
 #define BLE_HID_HOST_SYNC_TIMEOUT_MS 15000
 #define BLE_HID_ADV_UUID16_MAX 4
 #define MOD_CTRL (1U << 0)
@@ -1218,6 +1228,25 @@ static int lua_ble_hid_mouse_scroll(lua_State *L)
     return push_result(L, send_mouse(0, 0, wheel, pan));
 }
 
+/* Send the current button state, retrying a refused report (see MOUSE_BUTTON_TRIES). */
+static esp_err_t send_mouse_buttons(const char *what)
+{
+    esp_err_t err = ESP_FAIL;
+
+    for (int i = 0; i < MOUSE_BUTTON_TRIES; i++) {
+        err = send_mouse(0, 0, 0, 0);
+        if (err == ESP_OK) {
+            if (i > 0) {
+                ESP_LOGW(TAG, "mouse %s sent after %d retries", what, i);
+            }
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(MOUSE_RETRY_MS));
+    }
+    ESP_LOGW(TAG, "mouse %s failed after %d tries: %s", what, MOUSE_BUTTON_TRIES, esp_err_to_name(err));
+    return err;
+}
+
 static int lua_ble_hid_mouse_button(lua_State *L)
 {
     const char *button = luaL_checkstring(L, 1);
@@ -1230,23 +1259,33 @@ static int lua_ble_hid_mouse_button(lua_State *L)
     }
     if (strcmp(gesture, "down") == 0) {
         s_mouse_buttons |= mask;
-        return push_result(L, send_mouse(0, 0, 0, 0));
+        err = send_mouse_buttons("down");
+        if (err != ESP_OK) {
+            s_mouse_buttons &= (uint8_t)~mask;  /* not pressed on the phone: later moves must not drag */
+        }
+        return push_result(L, err);
     }
     if (strcmp(gesture, "up") == 0) {
         s_mouse_buttons &= (uint8_t)~mask;
-        return push_result(L, send_mouse(0, 0, 0, 0));
+        return push_result(L, send_mouse_buttons("up"));
     }
     if (strcmp(gesture, "click") != 0) {
         return luaL_error(L, "unsupported mouse gesture: %s", gesture);
     }
     s_mouse_buttons |= mask;
-    err = send_mouse(0, 0, 0, 0);
+    err = send_mouse_buttons("down");
     if (err != ESP_OK) {
+        s_mouse_buttons &= (uint8_t)~mask;
         return push_result(L, err);
     }
     vTaskDelay(pdMS_TO_TICKS(MOUSE_CLICK_MS));
     s_mouse_buttons &= (uint8_t)~mask;
-    return push_result(L, send_mouse(0, 0, 0, 0));
+    err = send_mouse_buttons("up");
+    vTaskDelay(pdMS_TO_TICKS(MOUSE_RELEASE_REPEAT_MS));
+    if (send_mouse_buttons("up again") == ESP_OK) {
+        err = ESP_OK;  /* one release that reached the phone is enough */
+    }
+    return push_result(L, err);
 }
 
 static int lua_ble_hid_release_all(lua_State *L)
